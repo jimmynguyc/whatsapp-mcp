@@ -2,6 +2,7 @@ from typing import List, Dict, Any, Optional
 from mcp.server.fastmcp import FastMCP
 from whatsapp import (
     search_contacts as whatsapp_search_contacts,
+    get_contact as whatsapp_get_contact,
     list_messages as whatsapp_list_messages,
     list_chats as whatsapp_list_chats,
     get_chat as whatsapp_get_chat,
@@ -9,9 +10,11 @@ from whatsapp import (
     get_contact_chats as whatsapp_get_contact_chats,
     get_last_interaction as whatsapp_get_last_interaction,
     get_message_context as whatsapp_get_message_context,
+    get_sender_name as whatsapp_get_sender_name,
     send_message as whatsapp_send_message,
     send_file as whatsapp_send_file,
     send_audio_message as whatsapp_audio_voice_message,
+    send_reaction as whatsapp_send_reaction,
     download_media as whatsapp_download_media
 )
 
@@ -27,6 +30,34 @@ def search_contacts(query: str) -> List[Dict[str, Any]]:
     """
     contacts = whatsapp_search_contacts(query)
     return contacts
+
+@mcp.tool()
+def get_contact(jid: str) -> Optional[Dict[str, Any]]:
+    """Resolve a single WhatsApp contact by JID.
+
+    Returns the contact's phone number, JID, and best-available display name
+    (full_name → first_name → push_name → business_name). Useful for turning
+    a sender JID from a group message into a human-readable name.
+
+    Args:
+        jid: The JID to resolve, e.g. "15551234567@s.whatsapp.net".
+    """
+    contact = whatsapp_get_contact(jid)
+    return contact
+
+@mcp.tool()
+def resolve_sender_name(jid: str) -> str:
+    """Return the best display name for a sender JID.
+
+    Checks the contacts table (populated from the WhatsMeow contact book and
+    per-message push names, including group participants) before falling back
+    to the chats table or a fuzzy phone-number match. Returns the raw JID if
+    nothing resolves.
+
+    Args:
+        jid: The sender JID.
+    """
+    return whatsapp_get_sender_name(jid)
 
 @mcp.tool()
 def list_messages(
@@ -220,6 +251,26 @@ def send_audio_message(recipient: str, media_path: str) -> Dict[str, Any]:
         "success": success,
         "message": status_message
     }
+
+@mcp.tool()
+def react_to_message(
+    message_id: str,
+    reaction: str,
+    chat_jid: Optional[str] = None,
+) -> Dict[str, Any]:
+    """React to a WhatsApp message with an emoji.
+
+    Args:
+        message_id: The ID of the target message (as seen in list_messages output).
+        reaction: The emoji to apply, e.g. "👍", "❤️", "😂". Pass "" to remove.
+        chat_jid: Optional JID of the chat — helpful if the same message_id
+                  could appear in multiple chats.
+
+    Returns:
+        A dictionary containing success status and a status message.
+    """
+    success, status_message = whatsapp_send_reaction(message_id, reaction, chat_jid)
+    return {"success": success, "message": status_message}
 
 @mcp.tool()
 def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:

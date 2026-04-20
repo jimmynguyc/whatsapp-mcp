@@ -8,7 +8,53 @@ import json
 import audio
 
 MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
+WHATSMEOW_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'whatsapp.db')
 WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
+
+
+def _normalize_jid(jid: str) -> str:
+    """Strip any device suffix from a JID user portion (e.g. "12345:7@s.whatsapp.net" -> "12345@s.whatsapp.net")."""
+    if not jid or '@' not in jid:
+        return jid
+    user, server = jid.split('@', 1)
+    if ':' in user:
+        user = user.split(':', 1)[0]
+    return f"{user}@{server}"
+
+
+def _user_part(jid: str) -> str:
+    """Return the user portion of a JID (the part before '@'), or the JID unchanged if no '@'."""
+    return jid.split('@', 1)[0] if '@' in jid else jid
+
+
+def _resolve_alt_jid(jid: str) -> Optional[str]:
+    """Return the LID↔phone alternate for a JID by consulting whatsmeow's lid map.
+
+    whatsmeow_lid_map stores raw user portions (no server suffix):
+      lid TEXT PRIMARY KEY, pn TEXT UNIQUE NOT NULL
+    """
+    if not jid or '@' not in jid:
+        return None
+    user, server = jid.split('@', 1)
+    try:
+        conn = sqlite3.connect(WHATSMEOW_DB_PATH)
+        cursor = conn.cursor()
+        if server == 'lid':
+            cursor.execute("SELECT pn FROM whatsmeow_lid_map WHERE lid = ? LIMIT 1", (user,))
+            row = cursor.fetchone()
+            if row and row[0]:
+                return f"{row[0]}@s.whatsapp.net"
+        elif server == 's.whatsapp.net':
+            cursor.execute("SELECT lid FROM whatsmeow_lid_map WHERE pn = ? LIMIT 1", (user,))
+            row = cursor.fetchone()
+            if row and row[0]:
+                return f"{row[0]}@lid"
+        return None
+    except sqlite3.Error:
+        return None
+    finally:
+        if 'conn' in locals():
+            conn.close()
 
 @dataclass
 class Message:
@@ -48,42 +94,74 @@ class MessageContext:
     after: List[Message]
 
 def get_sender_name(sender_jid: str) -> str:
+    """Resolve a sender JID to a human-readable name.
+
+    Lookup order:
+      1. contacts table by exact JID (full_name → first_name → push_name → business_name)
+      2. contacts table by the alternate JID (LID↔phone via whatsmeow_lid_map)
+      3. chats table by exact JID (direct-chat name)
+      4. chats table by the alternate JID
+      5. contacts/chats by phone-number substring
+      6. the raw JID as a last resort
+    """
+    normalized = _normalize_jid(sender_jid)
+    alt = _resolve_alt_jid(normalized)
+    phone_part = _user_part(normalized)
+
+    def _from_contacts(cursor, jid: str) -> Optional[str]:
+        cursor.execute(
+            "SELECT full_name, first_name, push_name, business_name FROM contacts WHERE jid = ? LIMIT 1",
+            (jid,),
+        )
+        row = cursor.fetchone()
+        if row:
+            for candidate in row:
+                if candidate:
+                    return candidate
+        return None
+
+    def _from_chats(cursor, jid: str) -> Optional[str]:
+        cursor.execute("SELECT name FROM chats WHERE jid = ? LIMIT 1", (jid,))
+        row = cursor.fetchone()
+        if row and row[0]:
+            return row[0]
+        return None
+
     try:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
-        
-        # First try matching by exact JID
-        cursor.execute("""
-            SELECT name
-            FROM chats
-            WHERE jid = ?
+
+        for jid in filter(None, [normalized, alt]):
+            if name := _from_contacts(cursor, jid):
+                return name
+
+        for jid in filter(None, [normalized, alt]):
+            if name := _from_chats(cursor, jid):
+                return name
+
+        # Fuzzy phone-number match as last resort
+        cursor.execute(
+            """
+            SELECT full_name, first_name, push_name, business_name
+            FROM contacts
+            WHERE jid LIKE ?
             LIMIT 1
-        """, (sender_jid,))
-        
-        result = cursor.fetchone()
-        
-        # If no result, try looking for the number within JIDs
-        if not result:
-            # Extract the phone number part if it's a JID
-            if '@' in sender_jid:
-                phone_part = sender_jid.split('@')[0]
-            else:
-                phone_part = sender_jid
-                
-            cursor.execute("""
-                SELECT name
-                FROM chats
-                WHERE jid LIKE ?
-                LIMIT 1
-            """, (f"%{phone_part}%",))
-            
-            result = cursor.fetchone()
-        
-        if result and result[0]:
-            return result[0]
-        else:
-            return sender_jid
-        
+            """,
+            (f"%{phone_part}%",),
+        )
+        row = cursor.fetchone()
+        if row:
+            for candidate in row:
+                if candidate:
+                    return candidate
+
+        cursor.execute("SELECT name FROM chats WHERE jid LIKE ? LIMIT 1", (f"%{phone_part}%",))
+        row = cursor.fetchone()
+        if row and row[0]:
+            return row[0]
+
+        return sender_jid
+
     except sqlite3.Error as e:
         print(f"Database error while getting sender name: {e}")
         return sender_jid
@@ -390,40 +468,104 @@ def list_chats(
             conn.close()
 
 
-def search_contacts(query: str) -> List[Contact]:
-    """Search contacts by name or phone number."""
+def get_contact(jid: str) -> Optional[Contact]:
+    """Resolve a single contact by JID using the contacts table, with chats and
+    LID↔phone alternates as fallback. The returned Contact keeps the JID the
+    caller asked about, but the name is resolved across both identifier forms."""
+    if not jid:
+        return None
+
+    normalized = _normalize_jid(jid)
+    alt = _resolve_alt_jid(normalized)
+
     try:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
-        
-        # Split query into characters to support partial matching
-        search_pattern = '%' +query + '%'
-        
-        cursor.execute("""
-            SELECT DISTINCT 
-                jid,
-                name
-            FROM chats
-            WHERE 
-                (LOWER(name) LIKE LOWER(?) OR LOWER(jid) LIKE LOWER(?))
-                AND jid NOT LIKE '%@g.us'
-            ORDER BY name, jid
-            LIMIT 50
-        """, (search_pattern, search_pattern))
-        
-        contacts = cursor.fetchall()
-        
-        result = []
-        for contact_data in contacts:
-            contact = Contact(
-                phone_number=contact_data[0].split('@')[0],
-                name=contact_data[1],
-                jid=contact_data[0]
+
+        phone_number = _user_part(normalized)
+
+        for candidate_jid in filter(None, [normalized, alt]):
+            cursor.execute(
+                "SELECT full_name, first_name, push_name, business_name FROM contacts WHERE jid = ? LIMIT 1",
+                (candidate_jid,),
             )
-            result.append(contact)
-            
+            row = cursor.fetchone()
+            if row:
+                full_name, first_name, push_name, business_name = row
+                name = full_name or first_name or push_name or business_name or None
+                if name:
+                    return Contact(phone_number=phone_number, name=name, jid=normalized)
+
+        for candidate_jid in filter(None, [normalized, alt]):
+            cursor.execute("SELECT name FROM chats WHERE jid = ? LIMIT 1", (candidate_jid,))
+            row = cursor.fetchone()
+            if row and row[0]:
+                return Contact(phone_number=phone_number, name=row[0], jid=normalized)
+
+        return None
+    except sqlite3.Error as e:
+        print(f"Database error in get_contact: {e}")
+        return None
+    finally:
+        if 'conn' in locals():
+            conn.close()
+
+
+def search_contacts(query: str) -> List[Contact]:
+    """Search contacts by name or phone number.
+
+    Unions the dedicated contacts table (populated from the WhatsMeow contact book
+    and push-name updates — including group participants) with the chats table.
+    """
+    try:
+        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        cursor = conn.cursor()
+
+        search_pattern = f"%{query}%"
+
+        cursor.execute("""
+            SELECT jid, name FROM (
+                SELECT
+                    jid,
+                    COALESCE(
+                        NULLIF(full_name, ''),
+                        NULLIF(first_name, ''),
+                        NULLIF(push_name, ''),
+                        NULLIF(business_name, '')
+                    ) AS name
+                FROM contacts
+                WHERE jid NOT LIKE '%@g.us'
+                  AND (
+                      LOWER(jid) LIKE LOWER(?)
+                      OR LOWER(COALESCE(full_name, '')) LIKE LOWER(?)
+                      OR LOWER(COALESCE(first_name, '')) LIKE LOWER(?)
+                      OR LOWER(COALESCE(push_name, '')) LIKE LOWER(?)
+                      OR LOWER(COALESCE(business_name, '')) LIKE LOWER(?)
+                  )
+
+                UNION
+
+                SELECT jid, name FROM chats
+                WHERE jid NOT LIKE '%@g.us'
+                  AND (LOWER(name) LIKE LOWER(?) OR LOWER(jid) LIKE LOWER(?))
+            )
+            ORDER BY name IS NULL, name, jid
+            LIMIT 50
+        """, (
+            search_pattern, search_pattern, search_pattern, search_pattern, search_pattern,
+            search_pattern, search_pattern,
+        ))
+
+        result = []
+        for jid, name in cursor.fetchall():
+            result.append(Contact(
+                phone_number=jid.split('@')[0],
+                name=name,
+                jid=jid,
+            ))
+
         return result
-        
+
     except sqlite3.Error as e:
         print(f"Database error: {e}")
         return []
@@ -723,6 +865,31 @@ def send_audio_message(recipient: str, media_path: str) -> Tuple[bool, str]:
         return False, f"Error parsing response: {response.text}"
     except Exception as e:
         return False, f"Unexpected error: {str(e)}"
+
+def send_reaction(message_id: str, reaction: str, chat_jid: Optional[str] = None) -> Tuple[bool, str]:
+    """Send an emoji reaction to a previously-received/sent message.
+
+    Args:
+        message_id: The ID of the message to react to.
+        reaction: The emoji (e.g. "👍"). Pass an empty string to remove an existing reaction.
+        chat_jid: Optional — disambiguates if the same message_id exists across chats.
+    """
+    if not message_id:
+        return False, "message_id must be provided"
+    try:
+        payload = {"message_id": message_id, "reaction": reaction}
+        if chat_jid:
+            payload["chat_jid"] = chat_jid
+        response = requests.post(f"{WHATSAPP_API_BASE_URL}/react", json=payload)
+        try:
+            result = response.json()
+        except json.JSONDecodeError:
+            return False, f"Error parsing response: {response.text}"
+        return bool(result.get("success", False)), result.get("message", "Unknown response")
+    except requests.RequestException as e:
+        return False, f"Request error: {e}"
+    except Exception as e:
+        return False, f"Unexpected error: {e}"
 
 def download_media(message_id: str, chat_jid: str) -> Optional[str]:
     """Download media from a message and return the local file path.

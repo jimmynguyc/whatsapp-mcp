@@ -66,7 +66,7 @@ func NewMessageStore() (*MessageStore, error) {
 			name TEXT,
 			last_message_time TIMESTAMP
 		);
-		
+
 		CREATE TABLE IF NOT EXISTS messages (
 			id TEXT,
 			chat_jid TEXT,
@@ -84,10 +84,28 @@ func NewMessageStore() (*MessageStore, error) {
 			PRIMARY KEY (id, chat_jid),
 			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
 		);
+
+		CREATE TABLE IF NOT EXISTS contacts (
+			jid TEXT PRIMARY KEY,
+			first_name TEXT,
+			full_name TEXT,
+			push_name TEXT,
+			business_name TEXT,
+			updated_at TIMESTAMP
+		);
 	`)
 	if err != nil {
 		db.Close()
 		return nil, fmt.Errorf("failed to create tables: %v", err)
+	}
+
+	// Add sender_jid column to messages for existing installs (idempotent).
+	// Stores the full sender JID with server suffix (@s.whatsapp.net or @lid) so
+	// reaction/revoke flows can reconstruct types.JID without guessing.
+	if _, err := db.Exec(`ALTER TABLE messages ADD COLUMN sender_jid TEXT`); err != nil &&
+		!strings.Contains(err.Error(), "duplicate column name") {
+		db.Close()
+		return nil, fmt.Errorf("failed to add sender_jid column: %v", err)
 	}
 
 	return &MessageStore{db: db}, nil
@@ -96,6 +114,51 @@ func NewMessageStore() (*MessageStore, error) {
 // Close the database connection
 func (store *MessageStore) Close() error {
 	return store.db.Close()
+}
+
+// Store or upsert a contact. Empty string fields do not overwrite existing non-empty values.
+func (store *MessageStore) StoreContact(jid, firstName, fullName, pushName, businessName string) error {
+	if jid == "" {
+		return nil
+	}
+	_, err := store.db.Exec(
+		`INSERT INTO contacts (jid, first_name, full_name, push_name, business_name, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(jid) DO UPDATE SET
+		   first_name    = CASE WHEN excluded.first_name    != '' THEN excluded.first_name    ELSE contacts.first_name    END,
+		   full_name     = CASE WHEN excluded.full_name     != '' THEN excluded.full_name     ELSE contacts.full_name     END,
+		   push_name     = CASE WHEN excluded.push_name     != '' THEN excluded.push_name     ELSE contacts.push_name     END,
+		   business_name = CASE WHEN excluded.business_name != '' THEN excluded.business_name ELSE contacts.business_name END,
+		   updated_at    = excluded.updated_at`,
+		jid, firstName, fullName, pushName, businessName, time.Now(),
+	)
+	return err
+}
+
+// Resolve a display name for a contact JID. Returns "" if no name found.
+// Priority: full_name → first_name → push_name → business_name.
+func (store *MessageStore) GetContactName(jid string) string {
+	var firstName, fullName, pushName, businessName sql.NullString
+	err := store.db.QueryRow(
+		"SELECT first_name, full_name, push_name, business_name FROM contacts WHERE jid = ?",
+		jid,
+	).Scan(&firstName, &fullName, &pushName, &businessName)
+	if err != nil {
+		return ""
+	}
+	if fullName.Valid && fullName.String != "" {
+		return fullName.String
+	}
+	if firstName.Valid && firstName.String != "" {
+		return firstName.String
+	}
+	if pushName.Valid && pushName.String != "" {
+		return pushName.String
+	}
+	if businessName.Valid && businessName.String != "" {
+		return businessName.String
+	}
+	return ""
 }
 
 // Store a chat in the database
@@ -108,7 +171,7 @@ func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time
 }
 
 // Store a message in the database
-func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, timestamp time.Time, isFromMe bool,
+func (store *MessageStore) StoreMessage(id, chatJID, sender, senderJID, content string, timestamp time.Time, isFromMe bool,
 	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
 	// Only store if there's actual content or media
 	if content == "" && mediaType == "" {
@@ -116,10 +179,10 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 	}
 
 	_, err := store.db.Exec(
-		`INSERT OR REPLACE INTO messages 
-		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length) 
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
+		`INSERT OR REPLACE INTO messages
+		(id, chat_jid, sender, sender_jid, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		id, chatJID, sender, senderJID, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
 	)
 	return err
 }
@@ -371,6 +434,75 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 	return true, fmt.Sprintf("Message sent to %s", recipient)
 }
 
+// ReactToMessageRequest is the body for POST /api/react.
+type ReactToMessageRequest struct {
+	MessageID string `json:"message_id"`
+	ChatJID   string `json:"chat_jid,omitempty"`
+	Reaction  string `json:"reaction"` // Empty string removes an existing reaction.
+}
+
+// reactToMessage sends a reaction to a previously-seen message. It looks up the
+// chat/sender from the messages table so callers only need the message ID; an
+// explicit ChatJID in the request takes precedence when both are stored.
+func reactToMessage(client *whatsmeow.Client, messageStore *MessageStore, req ReactToMessageRequest) (bool, string) {
+	if !client.IsConnected() {
+		return false, "Not connected to WhatsApp"
+	}
+	if req.MessageID == "" {
+		return false, "message_id is required"
+	}
+
+	var chatJIDStr, senderJIDStr sql.NullString
+	var isFromMe bool
+	query := "SELECT chat_jid, sender_jid, is_from_me FROM messages WHERE id = ?"
+	args := []any{req.MessageID}
+	if req.ChatJID != "" {
+		query += " AND chat_jid = ?"
+		args = append(args, req.ChatJID)
+	}
+	query += " LIMIT 1"
+
+	if err := messageStore.db.QueryRow(query, args...).Scan(&chatJIDStr, &senderJIDStr, &isFromMe); err != nil {
+		if err == sql.ErrNoRows {
+			return false, "Message not found in local store"
+		}
+		return false, fmt.Sprintf("Failed to look up message: %v", err)
+	}
+
+	chatJID, err := types.ParseJID(chatJIDStr.String)
+	if err != nil {
+		return false, fmt.Sprintf("Invalid chat JID %q: %v", chatJIDStr.String, err)
+	}
+
+	// Determine the reaction's sender arg for BuildReaction.
+	// For our own messages, pass an empty JID (whatsmeow sets FromMe=true).
+	// Otherwise pass the original sender — this is what actually identifies the target message.
+	var senderJID types.JID
+	if !isFromMe {
+		if senderJIDStr.Valid && senderJIDStr.String != "" {
+			senderJID, err = types.ParseJID(senderJIDStr.String)
+			if err != nil {
+				return false, fmt.Sprintf("Invalid sender JID %q: %v", senderJIDStr.String, err)
+			}
+		} else if chatJID.Server != types.GroupServer {
+			// Pre-migration 1:1 row with no sender_jid: the chat partner is the sender.
+			senderJID = chatJID
+		} else {
+			return false, "Cannot react: original sender unknown for this group message (pre-migration row)"
+		}
+	}
+
+	reactionMsg := client.BuildReaction(chatJID, senderJID, req.MessageID, req.Reaction)
+	if _, err := client.SendMessage(context.Background(), chatJID, reactionMsg); err != nil {
+		return false, fmt.Sprintf("Failed to send reaction: %v", err)
+	}
+
+	if req.Reaction == "" {
+		return true, "Reaction removed"
+	}
+	return true, fmt.Sprintf("Reacted with %s", req.Reaction)
+}
+
 // Extract media info from a message
 func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, url string, mediaKey []byte, fileSHA256 []byte, fileEncSHA256 []byte, fileLength uint64) {
 	if msg == nil {
@@ -414,6 +546,15 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	chatJID := msg.Info.Chat.String()
 	sender := msg.Info.Sender.User
 
+	// Capture push name for the sender — this is our best source of truth for group participants
+	// whose full/first name may not be in our contact book. Mirror onto the alt JID so that
+	// lookups by either @lid or @s.whatsapp.net resolve.
+	if msg.Info.PushName != "" && !msg.Info.IsFromMe {
+		if err := storeContactWithAlt(client, messageStore, msg.Info.Sender, "", "", msg.Info.PushName, ""); err != nil {
+			logger.Warnf("Failed to store push name for %s: %v", msg.Info.Sender.String(), err)
+		}
+	}
+
 	// Get appropriate chat name (pass nil for conversation since we don't have one for regular messages)
 	name := GetChatName(client, messageStore, msg.Info.Chat, chatJID, nil, sender, logger)
 
@@ -439,6 +580,7 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		msg.Info.ID,
 		chatJID,
 		sender,
+		msg.Info.Sender.ToNonAD().String(),
 		content,
 		msg.Info.Timestamp,
 		msg.Info.IsFromMe,
@@ -641,7 +783,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Download the media using whatsmeow client
-	mediaData, err := client.Download(downloader)
+	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -774,6 +916,108 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
+	// Handler for reacting to messages (emoji reaction)
+	http.HandleFunc("/api/react", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req ReactToMessageRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		success, message := reactToMessage(client, messageStore, req)
+		w.Header().Set("Content-Type", "application/json")
+		if !success {
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+		json.NewEncoder(w).Encode(SendMessageResponse{Success: success, Message: message})
+	})
+
+	// Handler for looking up contact info
+	http.HandleFunc("/api/contacts", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		jidParam := r.URL.Query().Get("jid")
+		queryParam := r.URL.Query().Get("q")
+		w.Header().Set("Content-Type", "application/json")
+
+		type contactRow struct {
+			JID          string `json:"jid"`
+			FirstName    string `json:"first_name,omitempty"`
+			FullName     string `json:"full_name,omitempty"`
+			PushName     string `json:"push_name,omitempty"`
+			BusinessName string `json:"business_name,omitempty"`
+			DisplayName  string `json:"display_name,omitempty"`
+		}
+
+		scanRow := func(rows *sql.Rows) (contactRow, error) {
+			var c contactRow
+			var first, full, push, business sql.NullString
+			if err := rows.Scan(&c.JID, &first, &full, &push, &business); err != nil {
+				return c, err
+			}
+			c.FirstName = first.String
+			c.FullName = full.String
+			c.PushName = push.String
+			c.BusinessName = business.String
+			c.DisplayName = messageStore.GetContactName(c.JID)
+			return c, nil
+		}
+
+		if jidParam != "" {
+			rows, err := messageStore.db.Query(
+				"SELECT jid, first_name, full_name, push_name, business_name FROM contacts WHERE jid = ?",
+				jidParam,
+			)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			defer rows.Close()
+			if rows.Next() {
+				c, err := scanRow(rows)
+				if err != nil {
+					http.Error(w, err.Error(), http.StatusInternalServerError)
+					return
+				}
+				json.NewEncoder(w).Encode(c)
+				return
+			}
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(map[string]string{"error": "not found"})
+			return
+		}
+
+		// Search mode: query by name substring
+		like := "%" + queryParam + "%"
+		rows, err := messageStore.db.Query(
+			`SELECT jid, first_name, full_name, push_name, business_name FROM contacts
+			 WHERE ? = '' OR jid LIKE ? OR first_name LIKE ? OR full_name LIKE ? OR push_name LIKE ? OR business_name LIKE ?
+			 ORDER BY COALESCE(NULLIF(full_name,''), NULLIF(first_name,''), NULLIF(push_name,''), NULLIF(business_name,''), jid)
+			 LIMIT 100`,
+			queryParam, like, like, like, like, like,
+		)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		defer rows.Close()
+		out := []contactRow{}
+		for rows.Next() {
+			c, err := scanRow(rows)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			out = append(out, c)
+		}
+		json.NewEncoder(w).Encode(out)
+	})
+
 	// Start the server
 	serverAddr := fmt.Sprintf(":%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
@@ -800,14 +1044,14 @@ func main() {
 		return
 	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
 
 	// Get device store - This contains session information
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// No device exists, create one
@@ -847,6 +1091,25 @@ func main() {
 
 		case *events.Connected:
 			logger.Infof("Connected to WhatsApp")
+
+		case *events.PushName:
+			// Sender's push name changed — update our contacts table.
+			if err := storeContactWithAlt(client, messageStore, v.JID, "", "", v.NewPushName, ""); err != nil {
+				logger.Warnf("Failed to persist push name update: %v", err)
+			}
+
+		case *events.BusinessName:
+			if err := storeContactWithAlt(client, messageStore, v.JID, "", "", "", v.NewBusinessName); err != nil {
+				logger.Warnf("Failed to persist business name update: %v", err)
+			}
+
+		case *events.Contact:
+			// App-state contact action (add/rename from another linked device).
+			if v.Action != nil {
+				if err := storeContactWithAlt(client, messageStore, v.JID, v.Action.GetFirstName(), v.Action.GetFullName(), "", ""); err != nil {
+					logger.Warnf("Failed to persist contact update: %v", err)
+				}
+			}
 
 		case *events.LoggedOut:
 			logger.Warnf("Device logged out, please scan QR code to log in again")
@@ -905,6 +1168,9 @@ func main() {
 
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
 
+	// Populate contacts table from whatsmeow's store
+	syncContactsFromWhatsmeow(client, messageStore, logger)
+
 	// Start REST API server
 	startRESTServer(client, messageStore, 8080)
 
@@ -920,6 +1186,50 @@ func main() {
 	fmt.Println("Disconnecting...")
 	// Disconnect client
 	client.Disconnect()
+}
+
+// storeContactWithAlt persists contact info under the given JID and, if an alternate
+// JID exists (LID ↔ phone), mirrors the same record there. This makes lookups robust
+// regardless of which identifier the caller has in hand — group messages typically
+// surface the @lid form while the actual contact name lives under the phone JID.
+func storeContactWithAlt(client *whatsmeow.Client, messageStore *MessageStore, jid types.JID, firstName, fullName, pushName, businessName string) error {
+	if jid.IsEmpty() {
+		return nil
+	}
+	primary := jid.ToNonAD()
+	if err := messageStore.StoreContact(primary.String(), firstName, fullName, pushName, businessName); err != nil {
+		return err
+	}
+	if client == nil || client.Store == nil {
+		return nil
+	}
+	altJID, err := client.Store.GetAltJID(context.Background(), primary)
+	if err != nil || altJID.IsEmpty() {
+		return nil
+	}
+	return messageStore.StoreContact(altJID.String(), firstName, fullName, pushName, businessName)
+}
+
+// syncContactsFromWhatsmeow pulls every contact from whatsmeow's store into our contacts table,
+// mirroring each entry under its LID alternate (and vice versa) so lookups by either JID succeed.
+func syncContactsFromWhatsmeow(client *whatsmeow.Client, messageStore *MessageStore, logger waLog.Logger) {
+	if client == nil || client.Store == nil || client.Store.Contacts == nil {
+		return
+	}
+	contacts, err := client.Store.Contacts.GetAllContacts(context.Background())
+	if err != nil {
+		logger.Warnf("Failed to load contacts from whatsmeow store: %v", err)
+		return
+	}
+	count := 0
+	for jid, info := range contacts {
+		if err := storeContactWithAlt(client, messageStore, jid, info.FirstName, info.FullName, info.PushName, info.BusinessName); err != nil {
+			logger.Warnf("Failed to store contact %s: %v", jid.String(), err)
+			continue
+		}
+		count++
+	}
+	logger.Infof("Synced %d contacts from whatsmeow store", count)
 }
 
 // GetChatName determines the appropriate name for a chat based on JID and other info
@@ -973,7 +1283,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 		// If we didn't get a name, try group info
 		if name == "" {
-			groupInfo, err := client.GetGroupInfo(jid)
+			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
 			if err == nil && groupInfo.Name != "" {
 				name = groupInfo.Name
 			} else {
@@ -987,16 +1297,30 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		// This is an individual contact
 		logger.Infof("Getting name for contact: %s", chatJID)
 
-		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(jid)
-		if err == nil && contact.FullName != "" {
-			name = contact.FullName
-		} else if sender != "" {
-			// Fallback to sender
-			name = sender
-		} else {
-			// Last fallback to JID
-			name = jid.User
+		// Prefer our contacts table (kept fresh by syncContactsFromWhatsmeow + push-name updates)
+		if resolved := messageStore.GetContactName(chatJID); resolved != "" {
+			name = resolved
+		} else if contact, err := client.Store.Contacts.GetContact(context.Background(), jid); err == nil {
+			// Fall back to whatsmeow's in-memory contact store
+			if contact.FullName != "" {
+				name = contact.FullName
+			} else if contact.FirstName != "" {
+				name = contact.FirstName
+			} else if contact.PushName != "" {
+				name = contact.PushName
+			} else if contact.BusinessName != "" {
+				name = contact.BusinessName
+			}
+			// Opportunistically persist (mirrors onto the LID alt JID too)
+			_ = storeContactWithAlt(client, messageStore, jid, contact.FirstName, contact.FullName, contact.PushName, contact.BusinessName)
+		}
+
+		if name == "" {
+			if sender != "" {
+				name = sender
+			} else {
+				name = jid.User
+			}
 		}
 
 		logger.Infof("Using contact name: %s", name)
@@ -1080,22 +1404,31 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					continue
 				}
 
-				// Determine sender
-				var sender string
+				// Determine sender (user portion) and full sender JID (with server suffix).
+				var sender, senderJID string
 				isFromMe := false
 				if msg.Message.Key != nil {
 					if msg.Message.Key.FromMe != nil {
 						isFromMe = *msg.Message.Key.FromMe
 					}
 					if !isFromMe && msg.Message.Key.Participant != nil && *msg.Message.Key.Participant != "" {
-						sender = *msg.Message.Key.Participant
-					} else if isFromMe {
+						senderJID = *msg.Message.Key.Participant
+						if pjid, perr := types.ParseJID(senderJID); perr == nil {
+							sender = pjid.User
+							senderJID = pjid.ToNonAD().String()
+						} else {
+							sender = senderJID
+						}
+					} else if isFromMe && client.Store.ID != nil {
 						sender = client.Store.ID.User
+						senderJID = client.Store.ID.ToNonAD().String()
 					} else {
 						sender = jid.User
+						senderJID = jid.ToNonAD().String()
 					}
 				} else {
 					sender = jid.User
+					senderJID = jid.ToNonAD().String()
 				}
 
 				// Store message
@@ -1116,6 +1449,7 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					msgID,
 					chatJID,
 					sender,
+					senderJID,
 					content,
 					timestamp,
 					isFromMe,
