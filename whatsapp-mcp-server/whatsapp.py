@@ -169,35 +169,31 @@ def get_sender_name(sender_jid: str) -> str:
         if 'conn' in locals():
             conn.close()
 
-def format_message(message: Message, show_chat_info: bool = True) -> None:
-    """Print a single message with consistent formatting."""
-    output = ""
-    
+def format_message(message: Message, show_chat_info: bool = True) -> str:
+    """Format a single message. Always includes Message ID and Chat JID so
+    downstream tools (react_to_message, download_media, get_message_context)
+    can target the message without a second lookup."""
+    header = f"[{message.timestamp:%Y-%m-%d %H:%M:%S}]"
     if show_chat_info and message.chat_name:
-        output += f"[{message.timestamp:%Y-%m-%d %H:%M:%S}] Chat: {message.chat_name} "
-    else:
-        output += f"[{message.timestamp:%Y-%m-%d %H:%M:%S}] "
-        
-    content_prefix = ""
-    if hasattr(message, 'media_type') and message.media_type:
-        content_prefix = f"[{message.media_type} - Message ID: {message.id} - Chat JID: {message.chat_jid}] "
-    
-    try:
-        sender_name = get_sender_name(message.sender) if not message.is_from_me else "Me"
-        output += f"From: {sender_name}: {content_prefix}{message.content}\n"
-    except Exception as e:
-        print(f"Error formatting message: {e}")
-    return output
+        header += f" Chat: {message.chat_name}"
 
-def format_messages_list(messages: List[Message], show_chat_info: bool = True) -> None:
-    output = ""
+    tags = [f"ID: {message.id}", f"Chat JID: {message.chat_jid}"]
+    if getattr(message, 'media_type', None):
+        tags.append(f"media: {message.media_type}")
+    meta = "[" + " | ".join(tags) + "]"
+
+    try:
+        sender_name = "Me" if message.is_from_me else get_sender_name(message.sender)
+    except Exception as e:
+        print(f"Error resolving sender name: {e}")
+        sender_name = message.sender
+
+    return f"{header} {meta} From: {sender_name}: {message.content}\n"
+
+def format_messages_list(messages: List[Message], show_chat_info: bool = True) -> str:
     if not messages:
-        output += "No messages to display."
-        return output
-    
-    for message in messages:
-        output += format_message(message, show_chat_info)
-    return output
+        return "No messages to display."
+    return "".join(format_message(m, show_chat_info) for m in messages)
 
 def list_messages(
     after: Optional[str] = None,
