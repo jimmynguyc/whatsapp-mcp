@@ -260,13 +260,170 @@ type SendMessageResponse struct {
 
 // SendMessageRequest represents the request body for the send message API
 type SendMessageRequest struct {
-	Recipient string `json:"recipient"`
-	Message   string `json:"message"`
-	MediaPath string `json:"media_path,omitempty"`
+	Recipient       string `json:"recipient"`
+	Message         string `json:"message"`
+	MediaPath       string `json:"media_path,omitempty"`
+	QuotedMessageID string `json:"quoted_message_id,omitempty"`
 }
 
+// groupParticipantOut is the JSON shape of a single group participant.
+type groupParticipantOut struct {
+	JID          string `json:"jid"`
+	LID          string `json:"lid,omitempty"`
+	PhoneNumber  string `json:"phone_number,omitempty"`
+	DisplayName  string `json:"display_name,omitempty"`
+	ResolvedName string `json:"resolved_name,omitempty"`
+	IsAdmin      bool   `json:"is_admin,omitempty"`
+	IsSuperAdmin bool   `json:"is_super_admin,omitempty"`
+}
+
+// groupInfoOut is the JSON shape of a single group's info.
+type groupInfoOut struct {
+	JID                    string                `json:"jid"`
+	Name                   string                `json:"name,omitempty"`
+	Topic                  string                `json:"topic,omitempty"`
+	Owner                  string                `json:"owner,omitempty"`
+	Created                time.Time             `json:"created"`
+	IsAnnounce             bool                  `json:"is_announce,omitempty"`
+	IsLocked               bool                  `json:"is_locked,omitempty"`
+	IsEphemeral            bool                  `json:"is_ephemeral,omitempty"`
+	DisappearingTimer      uint32                `json:"disappearing_timer,omitempty"`
+	IsJoinApprovalRequired bool                  `json:"is_join_approval_required,omitempty"`
+	ParticipantCount       int                   `json:"participant_count"`
+	Participants           []groupParticipantOut `json:"participants"`
+}
+
+// groupRequestOut is the JSON shape of a pending join request.
+type groupRequestOut struct {
+	JID          string    `json:"jid"`
+	ResolvedName string    `json:"resolved_name,omitempty"`
+	RequestedAt  time.Time `json:"requested_at"`
+}
+
+// formatGroupInfo flattens whatsmeow's GroupInfo struct for JSON output and
+// enriches each participant with a resolved display name from the contacts table.
+func formatGroupInfo(g *types.GroupInfo, messageStore *MessageStore) groupInfoOut {
+	parts := make([]groupParticipantOut, 0, len(g.Participants))
+	for _, p := range g.Participants {
+		// Try resolving by primary JID first, then phone, then LID — first match wins.
+		resolved := ""
+		for _, candidate := range []string{p.JID.String(), p.PhoneNumber.String(), p.LID.String()} {
+			if candidate == "" {
+				continue
+			}
+			if name := messageStore.GetContactName(candidate); name != "" && name != candidate {
+				resolved = name
+				break
+			}
+		}
+		parts = append(parts, groupParticipantOut{
+			JID:          p.JID.String(),
+			LID:          jidOrEmpty(p.LID),
+			PhoneNumber:  jidOrEmpty(p.PhoneNumber),
+			DisplayName:  p.DisplayName,
+			ResolvedName: resolved,
+			IsAdmin:      p.IsAdmin,
+			IsSuperAdmin: p.IsSuperAdmin,
+		})
+	}
+	owner := ""
+	if !g.OwnerJID.IsEmpty() {
+		owner = g.OwnerJID.String()
+	} else if !g.OwnerPN.IsEmpty() {
+		owner = g.OwnerPN.String()
+	}
+	return groupInfoOut{
+		JID:                    g.JID.String(),
+		Name:                   g.Name,
+		Topic:                  g.Topic,
+		Owner:                  owner,
+		Created:                g.GroupCreated,
+		IsAnnounce:             g.IsAnnounce,
+		IsLocked:               g.IsLocked,
+		IsEphemeral:            g.IsEphemeral,
+		DisappearingTimer:      g.DisappearingTimer,
+		IsJoinApprovalRequired: g.IsJoinApprovalRequired,
+		// GetJoinedGroups returns ParticipantCount=0 even when participants are populated;
+		// trust the actual list length when the count looks unset.
+		ParticipantCount: pickInt(g.ParticipantCount, len(g.Participants)),
+		Participants:     parts,
+	}
+}
+
+func jidOrEmpty(j types.JID) string {
+	if j.IsEmpty() {
+		return ""
+	}
+	return j.String()
+}
+
+func pickInt(primary, fallback int) int {
+	if primary > 0 {
+		return primary
+	}
+	return fallback
+}
+
+// MarkReadRequest is the body for POST /api/mark-read.
+type MarkReadRequest struct {
+	MessageIDs []string `json:"message_ids"`
+	ChatJID    string   `json:"chat_jid"`
+}
+
+// PresenceRequest is the body for POST /api/presence.
+// State must be one of: "composing" (typing), "recording" (voice), "paused",
+// "available" (global online), "unavailable" (global offline).
+// ChatJID is required for composing/recording/paused; ignored for available/unavailable.
+type PresenceRequest struct {
+	ChatJID string `json:"chat_jid,omitempty"`
+	State   string `json:"state"`
+}
+
+// buildQuoteContext looks up the quoted message in the local store and returns
+// a ContextInfo suitable for attaching to an outbound Message. Returns nil if
+// the message cannot be found — caller decides whether that is a hard error.
+func buildQuoteContext(messageStore *MessageStore, quotedMessageID, chatJID string) (*waProto.ContextInfo, error) {
+	if quotedMessageID == "" {
+		return nil, nil
+	}
+	var content, senderJID sql.NullString
+	var isFromMe bool
+	err := messageStore.db.QueryRow(
+		"SELECT content, sender_jid, is_from_me FROM messages WHERE id = ? AND chat_jid = ? LIMIT 1",
+		quotedMessageID, chatJID,
+	).Scan(&content, &senderJID, &isFromMe)
+	if err != nil {
+		return nil, fmt.Errorf("quoted message %s not found in chat %s: %w", quotedMessageID, chatJID, err)
+	}
+
+	participant := senderJID.String
+	if isFromMe || participant == "" {
+		// Our own message or pre-migration row: fall back to our own JID.
+		if ownJID := ownJIDString(); ownJID != "" {
+			participant = ownJID
+		}
+	}
+
+	ctx := &waProto.ContextInfo{
+		StanzaID: proto.String(quotedMessageID),
+		QuotedMessage: &waProto.Message{
+			Conversation: proto.String(content.String),
+		},
+	}
+	if participant != "" {
+		ctx.Participant = proto.String(participant)
+	}
+	return ctx, nil
+}
+
+// ownJIDString returns the connected account's bare JID as a string, or "" if unknown.
+// Package-level state; set in main() once login completes.
+var ownJIDStringVal string
+
+func ownJIDString() string { return ownJIDStringVal }
+
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
+func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, recipient string, message string, mediaPath string, quotedMessageID string) (bool, string) {
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp"
 	}
@@ -289,6 +446,15 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		recipientJID = types.JID{
 			User:   recipient,
 			Server: "s.whatsapp.net", // For personal chats
+		}
+	}
+
+	// Resolve optional quoted-message context from the local store.
+	var quoteCtx *waProto.ContextInfo
+	if quotedMessageID != "" {
+		quoteCtx, err = buildQuoteContext(messageStore, quotedMessageID, recipientJID.String())
+		if err != nil {
+			return false, fmt.Sprintf("Cannot quote: %v", err)
 		}
 	}
 
@@ -365,6 +531,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 				FileEncSHA256: resp.FileEncSHA256,
 				FileSHA256:    resp.FileSHA256,
 				FileLength:    &resp.FileLength,
+				ContextInfo:   quoteCtx,
 			}
 		case whatsmeow.MediaAudio:
 			// Handle ogg audio files
@@ -395,6 +562,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 				Seconds:       proto.Uint32(seconds),
 				PTT:           proto.Bool(true),
 				Waveform:      waveform,
+				ContextInfo:   quoteCtx,
 			}
 		case whatsmeow.MediaVideo:
 			msg.VideoMessage = &waProto.VideoMessage{
@@ -406,6 +574,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 				FileEncSHA256: resp.FileEncSHA256,
 				FileSHA256:    resp.FileSHA256,
 				FileLength:    &resp.FileLength,
+				ContextInfo:   quoteCtx,
 			}
 		case whatsmeow.MediaDocument:
 			msg.DocumentMessage = &waProto.DocumentMessage{
@@ -418,10 +587,19 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 				FileEncSHA256: resp.FileEncSHA256,
 				FileSHA256:    resp.FileSHA256,
 				FileLength:    &resp.FileLength,
+				ContextInfo:   quoteCtx,
 			}
 		}
 	} else {
-		msg.Conversation = proto.String(message)
+		if quoteCtx != nil {
+			// Quoted replies must use ExtendedTextMessage; Conversation cannot carry ContextInfo.
+			msg.ExtendedTextMessage = &waProto.ExtendedTextMessage{
+				Text:        proto.String(message),
+				ContextInfo: quoteCtx,
+			}
+		} else {
+			msg.Conversation = proto.String(message)
+		}
 	}
 
 	// Send message
@@ -432,6 +610,115 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 	}
 
 	return true, fmt.Sprintf("Message sent to %s", recipient)
+}
+
+// markMessagesRead marks one or more messages as read, emitting a read receipt
+// to the sender. For group chats, the receipt must name the original sender JID
+// of each message — we look that up from the local store. Messages from
+// different senders within the same call are dispatched in separate receipts.
+func markMessagesRead(client *whatsmeow.Client, messageStore *MessageStore, req MarkReadRequest) (bool, string) {
+	if !client.IsConnected() {
+		return false, "Not connected to WhatsApp"
+	}
+	if len(req.MessageIDs) == 0 {
+		return false, "message_ids is required"
+	}
+	if req.ChatJID == "" {
+		return false, "chat_jid is required"
+	}
+	chatJID, err := types.ParseJID(req.ChatJID)
+	if err != nil {
+		return false, fmt.Sprintf("Invalid chat_jid %q: %v", req.ChatJID, err)
+	}
+
+	// Group message IDs by sender so each receipt carries the right Participant.
+	bySender := map[string][]types.MessageID{}
+	for _, id := range req.MessageIDs {
+		var senderJIDStr sql.NullString
+		var isFromMe bool
+		err := messageStore.db.QueryRow(
+			"SELECT sender_jid, is_from_me FROM messages WHERE id = ? AND chat_jid = ? LIMIT 1",
+			id, req.ChatJID,
+		).Scan(&senderJIDStr, &isFromMe)
+		if err != nil {
+			return false, fmt.Sprintf("Message %s not found in chat %s: %v", id, req.ChatJID, err)
+		}
+		if isFromMe {
+			// Own messages don't need a read receipt from us.
+			continue
+		}
+		sender := senderJIDStr.String
+		if sender == "" {
+			// Pre-migration 1:1 row: sender == chat partner.
+			if chatJID.Server == types.GroupServer {
+				return false, fmt.Sprintf("Cannot mark group message %s read: sender unknown (pre-migration row)", id)
+			}
+			sender = chatJID.String()
+		}
+		bySender[sender] = append(bySender[sender], types.MessageID(id))
+	}
+
+	if len(bySender) == 0 {
+		return true, "No inbound messages to mark"
+	}
+
+	for senderStr, ids := range bySender {
+		senderJID, err := types.ParseJID(senderStr)
+		if err != nil {
+			return false, fmt.Sprintf("Invalid sender JID %q: %v", senderStr, err)
+		}
+		if err := client.MarkRead(context.Background(), ids, time.Now(), chatJID, senderJID); err != nil {
+			return false, fmt.Sprintf("Failed to mark read: %v", err)
+		}
+	}
+	return true, fmt.Sprintf("Marked %d message(s) read", len(req.MessageIDs))
+}
+
+// sendPresence dispatches either a global presence (available/unavailable) or
+// a per-chat presence (composing/recording/paused). Global presence may require
+// the account to have opted into presence reporting; per-chat works always.
+func sendPresence(client *whatsmeow.Client, req PresenceRequest) (bool, string) {
+	if !client.IsConnected() {
+		return false, "Not connected to WhatsApp"
+	}
+	switch req.State {
+	case "available":
+		if err := client.SendPresence(context.Background(), types.PresenceAvailable); err != nil {
+			return false, fmt.Sprintf("Failed to send presence: %v", err)
+		}
+		return true, "Presence: available"
+	case "unavailable":
+		if err := client.SendPresence(context.Background(), types.PresenceUnavailable); err != nil {
+			return false, fmt.Sprintf("Failed to send presence: %v", err)
+		}
+		return true, "Presence: unavailable"
+	case "composing", "recording", "paused":
+		if req.ChatJID == "" {
+			return false, "chat_jid is required for composing/recording/paused"
+		}
+		chatJID, err := types.ParseJID(req.ChatJID)
+		if err != nil {
+			return false, fmt.Sprintf("Invalid chat_jid %q: %v", req.ChatJID, err)
+		}
+		var state types.ChatPresence
+		var media types.ChatPresenceMedia
+		switch req.State {
+		case "composing":
+			state = types.ChatPresenceComposing
+			media = types.ChatPresenceMediaText
+		case "recording":
+			state = types.ChatPresenceComposing
+			media = types.ChatPresenceMediaAudio
+		case "paused":
+			state = types.ChatPresencePaused
+		}
+		if err := client.SendChatPresence(context.Background(), chatJID, state, media); err != nil {
+			return false, fmt.Sprintf("Failed to send chat presence: %v", err)
+		}
+		return true, fmt.Sprintf("Chat presence: %s", req.State)
+	default:
+		return false, fmt.Sprintf("Unknown state %q (expected composing/recording/paused/available/unavailable)", req.State)
+	}
 }
 
 // ReactToMessageRequest is the body for POST /api/react.
@@ -848,7 +1135,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		fmt.Println("Received request to send message", req.Message, req.MediaPath)
 
 		// Send the message
-		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
+		success, message := sendWhatsAppMessage(client, messageStore, req.Recipient, req.Message, req.MediaPath, req.QuotedMessageID)
 		fmt.Println("Message sent", success, message)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
@@ -914,6 +1201,44 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			Filename: filename,
 			Path:     path,
 		})
+	})
+
+	// Handler for marking messages as read (outbound read receipts)
+	http.HandleFunc("/api/mark-read", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req MarkReadRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		success, message := markMessagesRead(client, messageStore, req)
+		w.Header().Set("Content-Type", "application/json")
+		if !success {
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+		json.NewEncoder(w).Encode(SendMessageResponse{Success: success, Message: message})
+	})
+
+	// Handler for typing/online presence
+	http.HandleFunc("/api/presence", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req PresenceRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		success, message := sendPresence(client, req)
+		w.Header().Set("Content-Type", "application/json")
+		if !success {
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+		json.NewEncoder(w).Encode(SendMessageResponse{Success: success, Message: message})
 	})
 
 	// Handler for reacting to messages (emoji reaction)
@@ -1016,6 +1341,88 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			out = append(out, c)
 		}
 		json.NewEncoder(w).Encode(out)
+	})
+
+	// Handler for groups: list joined / get one / list pending join requests
+	http.HandleFunc("/api/groups", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+
+		mode := r.URL.Query().Get("mode") // "list" (default), "info", "requests"
+		if mode == "" {
+			mode = "list"
+		}
+
+		switch mode {
+		case "list":
+			groups, err := client.GetJoinedGroups(context.Background())
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+				return
+			}
+			out := make([]groupInfoOut, 0, len(groups))
+			for _, g := range groups {
+				out = append(out, formatGroupInfo(g, messageStore))
+			}
+			json.NewEncoder(w).Encode(out)
+			return
+
+		case "info":
+			jidStr := r.URL.Query().Get("jid")
+			if jidStr == "" {
+				http.Error(w, "jid is required", http.StatusBadRequest)
+				return
+			}
+			jid, err := types.ParseJID(jidStr)
+			if err != nil {
+				http.Error(w, fmt.Sprintf("invalid jid: %v", err), http.StatusBadRequest)
+				return
+			}
+			info, err := client.GetGroupInfo(context.Background(), jid)
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+				return
+			}
+			json.NewEncoder(w).Encode(formatGroupInfo(info, messageStore))
+			return
+
+		case "requests":
+			jidStr := r.URL.Query().Get("jid")
+			if jidStr == "" {
+				http.Error(w, "jid is required", http.StatusBadRequest)
+				return
+			}
+			jid, err := types.ParseJID(jidStr)
+			if err != nil {
+				http.Error(w, fmt.Sprintf("invalid jid: %v", err), http.StatusBadRequest)
+				return
+			}
+			requests, err := client.GetGroupRequestParticipants(context.Background(), jid)
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+				return
+			}
+			out := make([]groupRequestOut, 0, len(requests))
+			for _, p := range requests {
+				out = append(out, groupRequestOut{
+					JID:          p.JID.String(),
+					ResolvedName: messageStore.GetContactName(p.JID.String()),
+					RequestedAt:  p.RequestedAt,
+				})
+			}
+			json.NewEncoder(w).Encode(out)
+			return
+
+		default:
+			http.Error(w, fmt.Sprintf("unknown mode %q (expected list/info/requests)", mode), http.StatusBadRequest)
+			return
+		}
 	})
 
 	// Start the server
@@ -1167,6 +1574,10 @@ func main() {
 	}
 
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
+
+	if client.Store.ID != nil {
+		ownJIDStringVal = client.Store.ID.ToNonAD().String()
+	}
 
 	// Populate contacts table from whatsmeow's store
 	syncContactsFromWhatsmeow(client, messageStore, logger)

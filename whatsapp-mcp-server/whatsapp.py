@@ -760,18 +760,20 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
         if 'conn' in locals():
             conn.close()
 
-def send_message(recipient: str, message: str) -> Tuple[bool, str]:
+def send_message(recipient: str, message: str, quoted_message_id: Optional[str] = None) -> Tuple[bool, str]:
     try:
         # Validate input
         if not recipient:
             return False, "Recipient must be provided"
-        
+
         url = f"{WHATSAPP_API_BASE_URL}/send"
         payload = {
             "recipient": recipient,
             "message": message,
         }
-        
+        if quoted_message_id:
+            payload["quoted_message_id"] = quoted_message_id
+
         response = requests.post(url, json=payload)
         
         # Check if the request was successful
@@ -886,6 +888,107 @@ def send_reaction(message_id: str, reaction: str, chat_jid: Optional[str] = None
         return False, f"Request error: {e}"
     except Exception as e:
         return False, f"Unexpected error: {e}"
+
+def mark_read(message_ids: List[str], chat_jid: str) -> Tuple[bool, str]:
+    """Send a read receipt for one or more inbound messages in a chat.
+
+    Args:
+        message_ids: List of message IDs previously seen in the chat.
+        chat_jid: The chat's JID (e.g. "123@s.whatsapp.net" or "123@g.us").
+    """
+    if not message_ids:
+        return False, "message_ids must be provided"
+    if not chat_jid:
+        return False, "chat_jid must be provided"
+    try:
+        response = requests.post(
+            f"{WHATSAPP_API_BASE_URL}/mark-read",
+            json={"message_ids": message_ids, "chat_jid": chat_jid},
+        )
+        try:
+            result = response.json()
+        except json.JSONDecodeError:
+            return False, f"Error parsing response: {response.text}"
+        return bool(result.get("success", False)), result.get("message", "Unknown response")
+    except requests.RequestException as e:
+        return False, f"Request error: {e}"
+    except Exception as e:
+        return False, f"Unexpected error: {e}"
+
+
+def send_presence(state: str, chat_jid: Optional[str] = None) -> Tuple[bool, str]:
+    """Send typing/recording/online presence.
+
+    Args:
+        state: One of "composing" (typing), "recording" (voice), "paused",
+               "available" (global online), "unavailable" (global offline).
+        chat_jid: Required for composing/recording/paused; ignored otherwise.
+    """
+    if state not in ("composing", "recording", "paused", "available", "unavailable"):
+        return False, "Invalid state"
+    if state in ("composing", "recording", "paused") and not chat_jid:
+        return False, "chat_jid is required for composing/recording/paused"
+    try:
+        payload = {"state": state}
+        if chat_jid:
+            payload["chat_jid"] = chat_jid
+        response = requests.post(f"{WHATSAPP_API_BASE_URL}/presence", json=payload)
+        try:
+            result = response.json()
+        except json.JSONDecodeError:
+            return False, f"Error parsing response: {response.text}"
+        return bool(result.get("success", False)), result.get("message", "Unknown response")
+    except requests.RequestException as e:
+        return False, f"Request error: {e}"
+    except Exception as e:
+        return False, f"Unexpected error: {e}"
+
+
+def list_groups() -> List[Dict[str, Any]]:
+    """List every group the connected account is a member of."""
+    try:
+        response = requests.get(f"{WHATSAPP_API_BASE_URL}/groups", params={"mode": "list"})
+        if response.status_code != 200:
+            return []
+        return response.json() or []
+    except (requests.RequestException, json.JSONDecodeError):
+        return []
+
+
+def get_group_info(group_jid: str) -> Optional[Dict[str, Any]]:
+    """Fetch full info (participants, admins, topic, etc.) for one group."""
+    if not group_jid:
+        return None
+    try:
+        response = requests.get(
+            f"{WHATSAPP_API_BASE_URL}/groups",
+            params={"mode": "info", "jid": group_jid},
+        )
+        if response.status_code != 200:
+            return None
+        return response.json()
+    except (requests.RequestException, json.JSONDecodeError):
+        return None
+
+
+def get_group_request_participants(group_jid: str) -> List[Dict[str, Any]]:
+    """List pending join requests for a group with approval enabled.
+
+    Requires the connected account to be an admin of the group.
+    """
+    if not group_jid:
+        return []
+    try:
+        response = requests.get(
+            f"{WHATSAPP_API_BASE_URL}/groups",
+            params={"mode": "requests", "jid": group_jid},
+        )
+        if response.status_code != 200:
+            return []
+        return response.json() or []
+    except (requests.RequestException, json.JSONDecodeError):
+        return []
+
 
 def download_media(message_id: str, chat_jid: str) -> Optional[str]:
     """Download media from a message and return the local file path.

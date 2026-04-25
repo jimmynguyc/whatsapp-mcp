@@ -15,6 +15,11 @@ from whatsapp import (
     send_file as whatsapp_send_file,
     send_audio_message as whatsapp_audio_voice_message,
     send_reaction as whatsapp_send_reaction,
+    mark_read as whatsapp_mark_read,
+    send_presence as whatsapp_send_presence,
+    list_groups as whatsapp_list_groups,
+    get_group_info as whatsapp_get_group_info,
+    get_group_request_participants as whatsapp_get_group_request_participants,
     download_media as whatsapp_download_media
 )
 
@@ -188,7 +193,8 @@ def get_message_context(
 @mcp.tool()
 def send_message(
     recipient: str,
-    message: str
+    message: str,
+    quoted_message_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Send a WhatsApp message to a person or group. For group chats use the JID.
 
@@ -196,7 +202,10 @@ def send_message(
         recipient: The recipient - either a phone number with country code but no + or other symbols,
                  or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
         message: The message text to send
-    
+        quoted_message_id: Optional ID of a prior message in the same chat to quote
+                           (threaded reply). The quoted message must already be in
+                           the local store (i.e. seen via list_messages).
+
     Returns:
         A dictionary containing success status and a status message
     """
@@ -206,9 +215,8 @@ def send_message(
             "success": False,
             "message": "Recipient must be provided"
         }
-    
-    # Call the whatsapp_send_message function with the unified recipient parameter
-    success, status_message = whatsapp_send_message(recipient, message)
+
+    success, status_message = whatsapp_send_message(recipient, message, quoted_message_id)
     return {
         "success": success,
         "message": status_message
@@ -271,6 +279,77 @@ def react_to_message(
     """
     success, status_message = whatsapp_send_reaction(message_id, reaction, chat_jid)
     return {"success": success, "message": status_message}
+
+@mcp.tool()
+def mark_read(message_ids: List[str], chat_jid: str) -> Dict[str, Any]:
+    """Send a read receipt (blue ticks) for one or more messages in a chat.
+
+    Use this after your agent has actually processed an inbound message so the
+    customer sees it as read. Only inbound messages need to be marked — own
+    messages are filtered out server-side.
+
+    Args:
+        message_ids: IDs of the messages to acknowledge (as seen in list_messages).
+        chat_jid: The JID of the chat the messages belong to.
+    """
+    success, status_message = whatsapp_mark_read(message_ids, chat_jid)
+    return {"success": success, "message": status_message}
+
+
+@mcp.tool()
+def send_presence(state: str, chat_jid: Optional[str] = None) -> Dict[str, Any]:
+    """Send typing/recording or online presence to WhatsApp.
+
+    Use "composing" to show a "typing..." indicator while you compose a reply,
+    then either send the message (which implicitly clears it) or send "paused"
+    to clear it without sending. "available"/"unavailable" toggle the global
+    online indicator.
+
+    Args:
+        state: One of "composing", "recording", "paused", "available", "unavailable".
+        chat_jid: Required for composing/recording/paused; ignored for available/unavailable.
+    """
+    success, status_message = whatsapp_send_presence(state, chat_jid)
+    return {"success": success, "message": status_message}
+
+
+@mcp.tool()
+def list_groups() -> List[Dict[str, Any]]:
+    """List all WhatsApp groups the connected account is a member of.
+
+    Each entry includes the group JID, name, topic, owner, creation time,
+    participant count, admin/announce/lock flags, and the full participant list
+    with resolved display names.
+    """
+    return whatsapp_list_groups()
+
+
+@mcp.tool()
+def get_group_info(group_jid: str) -> Optional[Dict[str, Any]]:
+    """Fetch full info for a single WhatsApp group, including all participants.
+
+    Each participant entry includes their primary JID, LID and phone-form JID
+    (where available), admin status, and a resolved display name from the
+    contacts table.
+
+    Args:
+        group_jid: The group's JID, e.g. "120363xxx@g.us".
+    """
+    return whatsapp_get_group_info(group_jid)
+
+
+@mcp.tool()
+def get_group_request_participants(group_jid: str) -> List[Dict[str, Any]]:
+    """List pending join requests for a group that has approval enabled.
+
+    Requires the connected account to be an admin of that group. Returns an
+    empty list if the group has no pending requests or approval is off.
+
+    Args:
+        group_jid: The group's JID.
+    """
+    return whatsapp_get_group_request_participants(group_jid)
+
 
 @mcp.tool()
 def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
