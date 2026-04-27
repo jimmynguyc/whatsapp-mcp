@@ -24,6 +24,7 @@ import (
 
 	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
+	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -1469,6 +1470,14 @@ func main() {
 			return
 		}
 	}
+
+	// Set device name shown in WhatsApp linked devices list
+	hostname := os.Getenv("WHATSAPP_BRIDGE_HOSTNAME")
+	if hostname == "" {
+		hostname, _ = os.Hostname()
+	}
+	deviceName := "WhatsApp MCP Bridge (" + hostname + ")"
+	store.SetOSInfo(deviceName, [3]uint32{2, 2413, 9})
 
 	// Create client instance
 	client := whatsmeow.NewClient(deviceStore, logger)
