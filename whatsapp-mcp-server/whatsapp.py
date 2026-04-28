@@ -1015,6 +1015,31 @@ def get_group_request_participants(group_jid: str) -> List[Dict[str, Any]]:
         return []
 
 
+def get_group_invite_link(group_jid: str, reset: bool = False) -> Optional[str]:
+    """Fetch the https://chat.whatsapp.com/<code> invite link for a group.
+
+    Requires the connected account to be a participant (and an admin if the
+    group requires admin approval to share the link). Set reset=True to
+    revoke the previous link and generate a new one.
+    """
+    if not group_jid:
+        return None
+    try:
+        response = requests.get(
+            f"{WHATSAPP_API_BASE_URL}/groups",
+            params={
+                "mode": "invitelink",
+                "jid": group_jid,
+                "reset": "true" if reset else "false",
+            },
+        )
+        if response.status_code != 200:
+            return None
+        return response.json().get("link")
+    except (requests.RequestException, json.JSONDecodeError):
+        return None
+
+
 def download_media(message_id: str, chat_jid: str) -> Optional[str]:
     """Download media from a message and return the local file path.
     

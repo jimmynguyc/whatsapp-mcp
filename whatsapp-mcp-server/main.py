@@ -21,6 +21,7 @@ from whatsapp import (
     list_groups as whatsapp_list_groups,
     get_group_info as whatsapp_get_group_info,
     get_group_request_participants as whatsapp_get_group_request_participants,
+    get_group_invite_link as whatsapp_get_group_invite_link,
     download_media as whatsapp_download_media
 )
 
@@ -366,6 +367,23 @@ def get_group_request_participants(group_jid: str) -> List[Dict[str, Any]]:
         group_jid: The group's JID.
     """
     return whatsapp_get_group_request_participants(group_jid)
+
+
+@mcp.tool()
+def get_group_invite_link(group_jid: str, reset: bool = False) -> Dict[str, Any]:
+    """Get the shareable https://chat.whatsapp.com/<code> invite link for a group.
+
+    Requires the connected account to be a participant of the group (and an
+    admin, if the group restricts link sharing to admins).
+
+    Args:
+        group_jid: The group's JID, e.g. "120363xxx@g.us".
+        reset: If True, revoke the existing link and issue a new one.
+    """
+    link = whatsapp_get_group_invite_link(group_jid, reset)
+    if link:
+        return {"success": True, "link": link}
+    return {"success": False, "message": "Failed to fetch invite link"}
 
 
 @mcp.tool()

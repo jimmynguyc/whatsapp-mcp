@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -26,6 +27,7 @@ import (
 	"go.mau.fi/whatsmeow/appstate"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
 	waCommon "go.mau.fi/whatsmeow/proto/waCommon"
+	waSyncAction "go.mau.fi/whatsmeow/proto/waSyncAction"
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
@@ -431,6 +433,34 @@ var ownJIDStringVal string
 
 func ownJIDString() string { return ownJIDStringVal }
 
+func coerceMessageTimestamp(v any) (time.Time, error) {
+	switch t := v.(type) {
+	case time.Time:
+		return t, nil
+	case int64:
+		return time.Unix(t, 0), nil
+	case int:
+		return time.Unix(int64(t), 0), nil
+	case float64:
+		return time.Unix(int64(t), 0), nil
+	case []byte:
+		return coerceMessageTimestamp(string(t))
+	case string:
+		layouts := []string{time.RFC3339Nano, time.RFC3339, "2006-01-02 15:04:05-07:00", "2006-01-02 15:04:05Z07:00", "2006-01-02 15:04:05"}
+		for _, layout := range layouts {
+			if ts, err := time.Parse(layout, t); err == nil {
+				return ts, nil
+			}
+		}
+		if unixSec, err := strconv.ParseInt(t, 10, 64); err == nil {
+			return time.Unix(unixSec, 0), nil
+		}
+		return time.Time{}, fmt.Errorf("unsupported timestamp string %q", t)
+	default:
+		return time.Time{}, fmt.Errorf("unsupported timestamp type %T", v)
+	}
+}
+
 // Function to send a WhatsApp message
 func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, recipient string, message string, mediaPath string, quotedMessageID string) (bool, string) {
 	if !client.IsConnected() {
@@ -683,6 +713,80 @@ func markMessagesRead(client *whatsmeow.Client, messageStore *MessageStore, req 
 	return true, fmt.Sprintf("Marked %d message(s) read", len(req.MessageIDs))
 }
 
+// isSelfChat reports whether chatJID refers to the connected account itself —
+// i.e. the "Note to Self" / "Message Yourself" chat. Compares the user portion
+// to both phone-number and LID forms of the own JID, since either can appear.
+func isSelfChat(client *whatsmeow.Client, chatJID types.JID) bool {
+	if client.Store.ID == nil {
+		return false
+	}
+	if chatJID.User == client.Store.ID.User {
+		return true
+	}
+	if lid := client.Store.LID; !lid.IsEmpty() && chatJID.User == lid.User {
+		return true
+	}
+	return false
+}
+
+// buildSelfChatMarkPatch constructs a markChatAsRead app-state patch with a
+// multi-message range, matching what the official WhatsApp client emits when
+// toggling self-chat read/unread. The library's BuildMarkChatAsRead only puts
+// one message in the range, which the phone ignores for self-chat.
+func buildSelfChatMarkPatch(store *MessageStore, chatJID types.JID, read bool) (appstate.PatchInfo, error) {
+	const maxMessages = 500
+	rows, err := store.db.Query(
+		"SELECT id, timestamp FROM messages WHERE chat_jid = ? ORDER BY timestamp DESC LIMIT ?",
+		chatJID.String(), maxMessages,
+	)
+	if err != nil {
+		return appstate.PatchInfo{}, fmt.Errorf("query messages: %w", err)
+	}
+	defer rows.Close()
+
+	chatJIDStr := chatJID.String()
+	var msgs []*waSyncAction.SyncActionMessage
+	for rows.Next() {
+		var id string
+		var tsAny any
+		if err := rows.Scan(&id, &tsAny); err != nil {
+			return appstate.PatchInfo{}, fmt.Errorf("scan: %w", err)
+		}
+		ts, err := coerceMessageTimestamp(tsAny)
+		if err != nil {
+			continue
+		}
+		msgs = append(msgs, &waSyncAction.SyncActionMessage{
+			Key: &waCommon.MessageKey{
+				RemoteJID: proto.String(chatJIDStr),
+				FromMe:    proto.Bool(true),
+				ID:        proto.String(id),
+			},
+			Timestamp: proto.Int64(ts.Unix()),
+		})
+	}
+	if len(msgs) == 0 {
+		return appstate.PatchInfo{}, fmt.Errorf("no messages found in self-chat %s", chatJIDStr)
+	}
+
+	action := &waSyncAction.MarkChatAsReadAction{
+		Read: proto.Bool(read),
+		MessageRange: &waSyncAction.SyncActionMessageRange{
+			Messages: msgs,
+		},
+	}
+	return appstate.PatchInfo{
+		Type: appstate.WAPatchRegularLow,
+		Mutations: []appstate.MutationInfo{{
+			Index:   []string{appstate.IndexMarkChatAsRead, chatJIDStr},
+			Version: 3,
+			Value: &waSyncAction.SyncActionValue{
+				MarkChatAsReadAction: action,
+			},
+		}},
+	}, nil
+}
+
 // markChat sets the chat-level read/unread status (the blue dot in the chat list)
 // using WhatsApp's app state sync. This is distinct from markMessagesRead which
 // sends per-message read receipts (blue ticks).
@@ -700,27 +804,46 @@ func markChat(client *whatsmeow.Client, messageStore *MessageStore, req MarkChat
 
 	// Look up the most recent message to build the required MessageKey.
 	var msgID, senderJID sql.NullString
-	var timestamp int64
+	var tsAny any
 	var isFromMe bool
 	err = messageStore.db.QueryRow(
 		"SELECT id, sender_jid, timestamp, is_from_me FROM messages WHERE chat_jid = ? ORDER BY timestamp DESC LIMIT 1",
 		req.ChatJID,
-	).Scan(&msgID, &senderJID, &timestamp, &isFromMe)
+	).Scan(&msgID, &senderJID, &tsAny, &isFromMe)
 	if err != nil {
 		return false, fmt.Sprintf("No messages found in chat %s: %v", req.ChatJID, err)
 	}
 
-	msgKey := &waCommon.MessageKey{
-		RemoteJID: proto.String(req.ChatJID),
-		FromMe:    proto.Bool(isFromMe),
-		ID:        proto.String(msgID.String),
-	}
-	if senderJID.Valid && senderJID.String != "" {
-		msgKey.Participant = proto.String(senderJID.String)
+	lastMsgTime, err := coerceMessageTimestamp(tsAny)
+	if err != nil {
+		return false, fmt.Sprintf("Failed to parse latest message timestamp in chat %s: %v", req.ChatJID, err)
 	}
 
-	lastMsgTime := time.Unix(timestamp, 0)
-	patch := appstate.BuildMarkChatAsRead(chatJID, req.Read, lastMsgTime, msgKey)
+	// Build the MessageKey via whatsmeow so Participant is only set for group
+	// chats — setting it on 1:1/self chats produces a key the device silently
+	// rejects, leaving the chat unchanged on the phone.
+	var senderForKey types.JID
+	if !isFromMe && senderJID.Valid && senderJID.String != "" {
+		senderForKey, err = types.ParseJID(senderJID.String)
+		if err != nil {
+			return false, fmt.Sprintf("Invalid sender JID %q: %v", senderJID.String, err)
+		}
+	}
+	msgKey := client.BuildMessageKey(chatJID, senderForKey, msgID.String)
+
+	var patch appstate.PatchInfo
+	if isSelfChat(client, chatJID) {
+		// Self-chat: every message has FromMe=true, so a single-message range
+		// gives the phone no inbound anchor. The official client packs ~150+
+		// recent message keys into the range; replicate that or the patch is
+		// silently ignored.
+		patch, err = buildSelfChatMarkPatch(messageStore, chatJID, req.Read)
+		if err != nil {
+			return false, fmt.Sprintf("Failed to build self-chat patch: %v", err)
+		}
+	} else {
+		patch = appstate.BuildMarkChatAsRead(chatJID, req.Read, lastMsgTime, msgKey)
+	}
 
 	if err := client.SendAppState(context.Background(), patch); err != nil {
 		return false, fmt.Sprintf("Failed to mark chat: %v", err)
@@ -1429,7 +1552,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		}
 		w.Header().Set("Content-Type", "application/json")
 
-		mode := r.URL.Query().Get("mode") // "list" (default), "info", "requests"
+		mode := r.URL.Query().Get("mode") // "list" (default), "info", "requests", "invitelink"
 		if mode == "" {
 			mode = "list"
 		}
@@ -1497,8 +1620,29 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			json.NewEncoder(w).Encode(out)
 			return
 
+		case "invitelink":
+			jidStr := r.URL.Query().Get("jid")
+			if jidStr == "" {
+				http.Error(w, "jid is required", http.StatusBadRequest)
+				return
+			}
+			jid, err := types.ParseJID(jidStr)
+			if err != nil {
+				http.Error(w, fmt.Sprintf("invalid jid: %v", err), http.StatusBadRequest)
+				return
+			}
+			reset := r.URL.Query().Get("reset") == "true"
+			link, err := client.GetGroupInviteLink(context.Background(), jid, reset)
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+				return
+			}
+			json.NewEncoder(w).Encode(map[string]string{"link": link})
+			return
+
 		default:
-			http.Error(w, fmt.Sprintf("unknown mode %q (expected list/info/requests)", mode), http.StatusBadRequest)
+			http.Error(w, fmt.Sprintf("unknown mode %q (expected list/info/requests/invitelink)", mode), http.StatusBadRequest)
 			return
 		}
 	})
