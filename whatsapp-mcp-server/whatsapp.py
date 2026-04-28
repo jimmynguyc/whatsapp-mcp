@@ -916,6 +916,31 @@ def mark_read(message_ids: List[str], chat_jid: str) -> Tuple[bool, str]:
         return False, f"Unexpected error: {e}"
 
 
+def mark_chat(chat_jid: str, read: bool) -> Tuple[bool, str]:
+    """Mark a whole chat as read or unread (the blue dot in the chat list).
+
+    Args:
+        chat_jid: The chat's JID (e.g. "123@s.whatsapp.net" or "123@g.us").
+        read: True to mark as read (clear blue dot), False to mark as unread.
+    """
+    if not chat_jid:
+        return False, "chat_jid must be provided"
+    try:
+        response = requests.post(
+            f"{WHATSAPP_API_BASE_URL}/mark-chat",
+            json={"chat_jid": chat_jid, "read": read},
+        )
+        try:
+            result = response.json()
+        except json.JSONDecodeError:
+            return False, f"Error parsing response: {response.text}"
+        return bool(result.get("success", False)), result.get("message", "Unknown response")
+    except requests.RequestException as e:
+        return False, f"Request error: {e}"
+    except Exception as e:
+        return False, f"Unexpected error: {e}"
+
+
 def send_presence(state: str, chat_jid: Optional[str] = None) -> Tuple[bool, str]:
     """Send typing/recording/online presence.
 

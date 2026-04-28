@@ -16,6 +16,7 @@ from whatsapp import (
     send_audio_message as whatsapp_audio_voice_message,
     send_reaction as whatsapp_send_reaction,
     mark_read as whatsapp_mark_read,
+    mark_chat as whatsapp_mark_chat,
     send_presence as whatsapp_send_presence,
     list_groups as whatsapp_list_groups,
     get_group_info as whatsapp_get_group_info,
@@ -293,6 +294,22 @@ def mark_read(message_ids: List[str], chat_jid: str) -> Dict[str, Any]:
         chat_jid: The JID of the chat the messages belong to.
     """
     success, status_message = whatsapp_mark_read(message_ids, chat_jid)
+    return {"success": success, "message": status_message}
+
+
+@mcp.tool()
+def mark_chat(chat_jid: str, read: bool) -> Dict[str, Any]:
+    """Mark a whole chat as read or unread (the blue dot in the chat list).
+
+    This is different from mark_read which sends blue-tick receipts for
+    individual messages. Use read=false to show the unread indicator,
+    read=true to clear it.
+
+    Args:
+        chat_jid: The JID of the chat (e.g. "123@s.whatsapp.net" or "group@g.us").
+        read: True to mark as read (clear blue dot), False to mark as unread.
+    """
+    success, status_message = whatsapp_mark_chat(chat_jid, read)
     return {"success": success, "message": status_message}
 
 

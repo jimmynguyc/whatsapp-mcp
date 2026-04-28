@@ -23,7 +23,9 @@ import (
 	"bytes"
 
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/appstate"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
+	waCommon "go.mau.fi/whatsmeow/proto/waCommon"
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
@@ -371,6 +373,12 @@ type MarkReadRequest struct {
 	ChatJID    string   `json:"chat_jid"`
 }
 
+// MarkChatRequest is the body for POST /api/mark-chat.
+type MarkChatRequest struct {
+	ChatJID string `json:"chat_jid"`
+	Read    bool   `json:"read"`
+}
+
 // PresenceRequest is the body for POST /api/presence.
 // State must be one of: "composing" (typing), "recording" (voice), "paused",
 // "available" (global online), "unavailable" (global offline).
@@ -673,6 +681,56 @@ func markMessagesRead(client *whatsmeow.Client, messageStore *MessageStore, req 
 		}
 	}
 	return true, fmt.Sprintf("Marked %d message(s) read", len(req.MessageIDs))
+}
+
+// markChat sets the chat-level read/unread status (the blue dot in the chat list)
+// using WhatsApp's app state sync. This is distinct from markMessagesRead which
+// sends per-message read receipts (blue ticks).
+func markChat(client *whatsmeow.Client, messageStore *MessageStore, req MarkChatRequest) (bool, string) {
+	if !client.IsConnected() {
+		return false, "Not connected to WhatsApp"
+	}
+	if req.ChatJID == "" {
+		return false, "chat_jid is required"
+	}
+	chatJID, err := types.ParseJID(req.ChatJID)
+	if err != nil {
+		return false, fmt.Sprintf("Invalid chat_jid %q: %v", req.ChatJID, err)
+	}
+
+	// Look up the most recent message to build the required MessageKey.
+	var msgID, senderJID sql.NullString
+	var timestamp int64
+	var isFromMe bool
+	err = messageStore.db.QueryRow(
+		"SELECT id, sender_jid, timestamp, is_from_me FROM messages WHERE chat_jid = ? ORDER BY timestamp DESC LIMIT 1",
+		req.ChatJID,
+	).Scan(&msgID, &senderJID, &timestamp, &isFromMe)
+	if err != nil {
+		return false, fmt.Sprintf("No messages found in chat %s: %v", req.ChatJID, err)
+	}
+
+	msgKey := &waCommon.MessageKey{
+		RemoteJID: proto.String(req.ChatJID),
+		FromMe:    proto.Bool(isFromMe),
+		ID:        proto.String(msgID.String),
+	}
+	if senderJID.Valid && senderJID.String != "" {
+		msgKey.Participant = proto.String(senderJID.String)
+	}
+
+	lastMsgTime := time.Unix(timestamp, 0)
+	patch := appstate.BuildMarkChatAsRead(chatJID, req.Read, lastMsgTime, msgKey)
+
+	if err := client.SendAppState(context.Background(), patch); err != nil {
+		return false, fmt.Sprintf("Failed to mark chat: %v", err)
+	}
+
+	action := "unread"
+	if req.Read {
+		action = "read"
+	}
+	return true, fmt.Sprintf("Marked chat %s as %s", req.ChatJID, action)
 }
 
 // sendPresence dispatches either a global presence (available/unavailable) or
@@ -1216,6 +1274,25 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			return
 		}
 		success, message := markMessagesRead(client, messageStore, req)
+		w.Header().Set("Content-Type", "application/json")
+		if !success {
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+		json.NewEncoder(w).Encode(SendMessageResponse{Success: success, Message: message})
+	})
+
+	// Handler for marking a whole chat as read/unread (blue dot)
+	http.HandleFunc("/api/mark-chat", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req MarkChatRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		success, message := markChat(client, messageStore, req)
 		w.Header().Set("Content-Type", "application/json")
 		if !success {
 			w.WriteHeader(http.StatusInternalServerError)
