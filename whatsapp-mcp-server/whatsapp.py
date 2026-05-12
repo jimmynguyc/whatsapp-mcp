@@ -7,8 +7,9 @@ import requests
 import json
 import audio
 
-MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
-WHATSMEOW_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'whatsapp.db')
+STORE_DIR = os.environ.get('WHATSAPP_STORE_DIR', os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store'))
+MESSAGES_DB_PATH = os.path.join(STORE_DIR, 'messages.db')
+WHATSMEOW_DB_PATH = os.path.join(STORE_DIR, 'whatsapp.db')
 WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
 
 
