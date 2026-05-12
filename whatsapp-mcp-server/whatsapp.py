@@ -632,7 +632,7 @@ def get_contact(jid: str) -> Optional[Contact]:
     try:
         conn = _get_conn()
         cursor = conn.cursor()
-        phone_number = _user_part(normalized)
+        phone_number = _resolve_phone(normalized) or _user_part(normalized)
 
         for candidate_jid in filter(None, [normalized, alt]):
             cursor.execute(
@@ -700,10 +700,14 @@ def search_contacts(query: str) -> List[Contact]:
             search_pattern, search_pattern,
         ))
 
+        rows = cursor.fetchall()
+        jids = [row[0] for row in rows]
+        phone_map = _bulk_resolve_phones(jids)
+
         result = []
-        for jid, name in cursor.fetchall():
+        for jid, name in rows:
             result.append(Contact(
-                phone_number=jid.split('@')[0],
+                phone_number=phone_map.get(jid, jid.split('@')[0]),
                 name=name,
                 jid=jid,
             ))
