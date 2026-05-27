@@ -642,7 +642,31 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 			mediaType = whatsmeow.MediaVideo
 			mimeType = "video/quicktime"
 
-		// Document types (for any other file type)
+		// Document types
+		case "pdf":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "application/pdf"
+		case "doc":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "application/msword"
+		case "docx":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+		case "xls":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "application/vnd.ms-excel"
+		case "xlsx":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+		case "csv":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "text/csv"
+		case "txt":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "text/plain"
+		case "zip":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "application/zip"
 		default:
 			mediaType = whatsmeow.MediaDocument
 			mimeType = "application/octet-stream"
@@ -714,8 +738,24 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 				ContextInfo:   quoteCtx,
 			}
 		case whatsmeow.MediaDocument:
+			// Extract filename from path; strip leading hex prefix (e.g. "a1b2_") if present
+			docTitle := mediaPath[strings.LastIndex(mediaPath, "/")+1:]
+			if len(docTitle) > 9 && docTitle[8] == '_' {
+				// Check if first 8 chars are hex
+				isHex := true
+				for _, c := range docTitle[:8] {
+					if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+						isHex = false
+						break
+					}
+				}
+				if isHex {
+					docTitle = docTitle[9:]
+				}
+			}
 			msg.DocumentMessage = &waProto.DocumentMessage{
-				Title:         proto.String(mediaPath[strings.LastIndex(mediaPath, "/")+1:]),
+				Title:         proto.String(docTitle),
+				FileName:      proto.String(docTitle),
 				Caption:       proto.String(message),
 				Mimetype:      proto.String(mimeType),
 				URL:           &resp.URL,
@@ -1062,8 +1102,9 @@ func revokeMessage(client *whatsmeow.Client, messageStore *MessageStore, req Rev
 		return false, fmt.Sprintf("Failed to revoke message: %v", err)
 	}
 	// Mark as deleted in local DB (preserve content for records)
-	messageStore.db.Exec("UPDATE messages SET media_type = 'deleted' WHERE id = ? AND chat_jid = ?", req.MessageID, req.ChatJID)
-	messageStore.db.Exec("DELETE FROM reactions WHERE message_id = ? AND chat_jid = ?", req.MessageID, req.ChatJID)
+	// Use message ID only — the chat JID might differ between @lid and @s.whatsapp.net
+	messageStore.db.Exec("UPDATE messages SET media_type = 'deleted' WHERE id = ?", req.MessageID)
+	messageStore.db.Exec("DELETE FROM reactions WHERE message_id = ?", req.MessageID)
 	return true, "Message deleted for everyone"
 }
 
@@ -1181,7 +1222,10 @@ func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, 
 	if doc := msg.GetDocumentMessage(); doc != nil {
 		filename := doc.GetFileName()
 		if filename == "" {
-			filename = "document_" + time.Now().Format("20060102_150405")
+			filename = doc.GetTitle()
+		}
+		if filename == "" {
+			filename = "document_" + uid
 		}
 		return "document", filename,
 			doc.GetURL(), doc.GetMediaKey(), doc.GetFileSHA256(), doc.GetFileEncSHA256(), doc.GetFileLength()
@@ -1271,8 +1315,8 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		if key := proto.GetKey(); key != nil {
 			revokedID := key.GetID()
 			if revokedID != "" {
-				messageStore.db.Exec("UPDATE messages SET media_type = 'deleted' WHERE id = ? AND chat_jid = ?", revokedID, chatJID)
-				messageStore.db.Exec("DELETE FROM reactions WHERE message_id = ? AND chat_jid = ?", revokedID, chatJID)
+				messageStore.db.Exec("UPDATE messages SET media_type = 'deleted' WHERE id = ?", revokedID)
+				messageStore.db.Exec("DELETE FROM reactions WHERE message_id = ?", revokedID)
 				direction := "←"
 				if msg.Info.IsFromMe {
 					direction = "→"
