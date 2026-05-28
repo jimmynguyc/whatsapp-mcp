@@ -259,8 +259,10 @@ func (store *MessageStore) resolveLIDMergePhone(jid string, whatsmeowDB *sql.DB)
 		return jid // No phone chat exists, nothing to merge
 	}
 
-	// Migrate messages from phone chat to LID chat
-	_, err = store.db.Exec("UPDATE messages SET chat_jid = ? WHERE chat_jid = ?", jid, phoneJID)
+	// Migrate messages from phone chat to LID chat (OR IGNORE skips duplicate message IDs)
+	_, err = store.db.Exec("UPDATE OR IGNORE messages SET chat_jid = ? WHERE chat_jid = ?", jid, phoneJID)
+	// Clean up any remaining duplicates that couldn't be moved
+	store.db.Exec("DELETE FROM messages WHERE chat_jid = ?", phoneJID)
 	if err != nil {
 		fmt.Printf("ResolveChatJID: failed to migrate messages from %s to %s: %v\n", phoneJID, jid, err)
 		return jid
