@@ -199,36 +199,81 @@ func (store *MessageStore) GetContactName(jid string) string {
 	return ""
 }
 
-// ResolveChatJID checks if a @s.whatsapp.net JID has an existing @lid chat.
-// If so, returns the LID JID to avoid creating duplicate chats.
-// For group chats or LID JIDs, returns the input unchanged.
+// ResolveChatJID prevents duplicate chats for the same contact.
+// - If a @s.whatsapp.net JID arrives and a @lid chat exists, returns the LID JID.
+// - If a @lid JID arrives and a @s.whatsapp.net chat exists, migrates messages to LID and returns LID.
+// Group chats are returned unchanged.
 func (store *MessageStore) ResolveChatJID(jid string) string {
-	if !strings.HasSuffix(jid, "@s.whatsapp.net") {
+	if strings.HasSuffix(jid, "@g.us") {
 		return jid
 	}
-	phone := strings.Split(jid, "@")[0]
 
-	// Look up LID from whatsmeow DB
 	whatsmeowDB, err := sql.Open("sqlite3", "file:store/whatsapp.db?mode=ro")
 	if err != nil {
 		return jid
 	}
 	defer whatsmeowDB.Close()
 
+	if strings.HasSuffix(jid, "@s.whatsapp.net") {
+		return store.resolvePhoneToLID(jid, whatsmeowDB)
+	}
+	if strings.HasSuffix(jid, "@lid") {
+		return store.resolveLIDMergePhone(jid, whatsmeowDB)
+	}
+	return jid
+}
+
+// resolvePhoneToLID: if a LID chat already exists for this phone, route to it.
+func (store *MessageStore) resolvePhoneToLID(jid string, whatsmeowDB *sql.DB) string {
+	phone := strings.Split(jid, "@")[0]
+
 	var lid string
-	err = whatsmeowDB.QueryRow("SELECT lid FROM whatsmeow_lid_map WHERE pn = ? LIMIT 1", phone).Scan(&lid)
+	err := whatsmeowDB.QueryRow("SELECT lid FROM whatsmeow_lid_map WHERE pn = ? LIMIT 1", phone).Scan(&lid)
 	if err != nil || lid == "" {
 		return jid
 	}
 
-	// Check if a chat with this LID already exists in messages DB
 	lidJID := lid + "@lid"
 	var count int
 	err = store.db.QueryRow("SELECT COUNT(*) FROM chats WHERE jid = ?", lidJID).Scan(&count)
 	if err != nil || count == 0 {
-		return jid // No existing LID chat, keep the phone JID
+		return jid
 	}
 	return lidJID
+}
+
+// resolveLIDMergePhone: if a @s.whatsapp.net chat exists for the same phone, migrate its messages to the LID chat.
+func (store *MessageStore) resolveLIDMergePhone(jid string, whatsmeowDB *sql.DB) string {
+	lid := strings.Split(jid, "@")[0]
+
+	var phone string
+	err := whatsmeowDB.QueryRow("SELECT pn FROM whatsmeow_lid_map WHERE lid = ? LIMIT 1", lid).Scan(&phone)
+	if err != nil || phone == "" {
+		return jid
+	}
+
+	phoneJID := phone + "@s.whatsapp.net"
+	var count int
+	err = store.db.QueryRow("SELECT COUNT(*) FROM chats WHERE jid = ?", phoneJID).Scan(&count)
+	if err != nil || count == 0 {
+		return jid // No phone chat exists, nothing to merge
+	}
+
+	// Migrate messages from phone chat to LID chat
+	_, err = store.db.Exec("UPDATE messages SET chat_jid = ? WHERE chat_jid = ?", jid, phoneJID)
+	if err != nil {
+		fmt.Printf("ResolveChatJID: failed to migrate messages from %s to %s: %v\n", phoneJID, jid, err)
+		return jid
+	}
+
+	// Delete the old phone chat entry
+	store.db.Exec("DELETE FROM chats WHERE jid = ?", phoneJID)
+	// Move pinned status if any
+	store.db.Exec("UPDATE OR IGNORE pinned_chats SET jid = ? WHERE jid = ?", jid, phoneJID)
+	store.db.Exec("DELETE FROM pinned_chats WHERE jid = ?", phoneJID)
+
+	fmt.Printf("ResolveChatJID: merged chat %s into %s\n", phoneJID, jid)
+	return jid
 }
 
 // Store a chat in the database
