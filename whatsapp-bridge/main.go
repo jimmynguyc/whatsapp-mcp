@@ -13,13 +13,13 @@ import (
 	"os/signal"
 	"path/filepath"
 	"reflect"
+	"sync"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
-	"github.com/mdp/qrterminal"
 
 	"bytes"
 
@@ -582,6 +582,20 @@ var (
 	disconnectedAt    *time.Time
 	loggedOut         bool
 	reconnectAttempts int
+)
+
+// QR re-login flow state
+var (
+	qrMu     sync.Mutex
+	qrStatus string // "", "waiting", "success", "timeout"
+)
+
+// References needed for runtime re-login
+var (
+	activeClient   *whatsmeow.Client
+	storeContainer *sqlstore.Container
+	msgStore       *MessageStore
+	bridgeLogger   waLog.Logger
 )
 
 func ownJIDString() string { return ownJIDStringVal }
@@ -1683,10 +1697,14 @@ func attemptReconnect(client *whatsmeow.Client, logger waLog.Logger) {
 	logger.Errorf("Failed to reconnect after %d attempts. Manual intervention required.", len(delays))
 }
 
-func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
+func startRESTServer(_ *whatsmeow.Client, messageStore *MessageStore, port int) {
+	// getClient returns the current active client (may change after QR re-login).
+	getClient := func() *whatsmeow.Client { return activeClient }
+
 	// Connection status endpoint
 	http.HandleFunc("/api/status", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		client := getClient()
 		status := map[string]interface{}{
 			"connected":      client.IsConnected(),
 			"logged_in":      client.Store.ID != nil && !loggedOut,
@@ -1703,6 +1721,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 
 	// Handler for sending messages
 	http.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
+		client := getClient()
 		// Only allow POST requests
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -1749,6 +1768,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 
 	// Handler for downloading media
 	http.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
+		client := getClient()
 		// Only allow POST requests
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -1800,6 +1820,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 
 	// Handler for marking messages as read (outbound read receipts)
 	http.HandleFunc("/api/mark-read", func(w http.ResponseWriter, r *http.Request) {
+		client := getClient()
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -1819,6 +1840,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 
 	// Handler for marking a whole chat as read/unread (blue dot)
 	http.HandleFunc("/api/mark-chat", func(w http.ResponseWriter, r *http.Request) {
+		client := getClient()
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -1838,6 +1860,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 
 	// Handler for typing/online presence
 	http.HandleFunc("/api/presence", func(w http.ResponseWriter, r *http.Request) {
+		client := getClient()
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -1857,6 +1880,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 
 	// Handler for reacting to messages (emoji reaction)
 	http.HandleFunc("/api/react", func(w http.ResponseWriter, r *http.Request) {
+		client := getClient()
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -1876,6 +1900,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 
 	// Handler for deleting messages (revoke for everyone)
 	http.HandleFunc("/api/revoke", func(w http.ResponseWriter, r *http.Request) {
+		client := getClient()
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -1978,6 +2003,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 
 	// Handler for groups: list joined / get one / list pending join requests
 	http.HandleFunc("/api/groups", func(w http.ResponseWriter, r *http.Request) {
+		client := getClient()
 		if r.Method != http.MethodGet {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -2081,6 +2107,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 
 	// Handler for triggering history re-sync (full or per-chat)
 	http.HandleFunc("/api/resync", func(w http.ResponseWriter, r *http.Request) {
+		client := getClient()
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -2192,6 +2219,168 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 				Message: fmt.Sprintf("Resync requested for %d chats (%d failed)", synced, failed),
 			})
 		}
+	})
+
+	// QR re-login endpoint
+	http.HandleFunc("/api/qr", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+
+		if activeClient.Store.ID != nil && !loggedOut {
+			json.NewEncoder(w).Encode(map[string]string{"status": "already_logged_in"})
+			return
+		}
+
+		qrMu.Lock()
+		if qrStatus == "waiting" {
+			qrMu.Unlock()
+			json.NewEncoder(w).Encode(map[string]string{"status": "already_waiting"})
+			return
+		}
+		qrStatus = "waiting"
+		qrMu.Unlock()
+
+		// Disconnect old client
+		activeClient.Disconnect()
+
+		// Delete old device and create fresh one
+		if activeClient.Store.ID != nil {
+			_ = storeContainer.DeleteDevice(context.Background(), activeClient.Store)
+		}
+		deviceStore := storeContainer.NewDevice()
+
+		hostname := os.Getenv("WHATSAPP_BRIDGE_HOSTNAME")
+		if hostname == "" {
+			hostname, _ = os.Hostname()
+		}
+		store.DeviceProps.PlatformType = waCompanionReg.DeviceProps_CHROME.Enum()
+		store.SetOSInfo("WA Bridge ("+hostname+")", [3]uint32{2, 2413, 9})
+
+		newClient := whatsmeow.NewClient(deviceStore, bridgeLogger)
+
+		// Re-register event handler
+		newClient.AddEventHandler(func(evt interface{}) {
+			switch v := evt.(type) {
+			case *events.Message:
+				handleMessage(newClient, msgStore, v, bridgeLogger)
+			case *events.HistorySync:
+				handleHistorySync(newClient, msgStore, v, bridgeLogger)
+			case *events.Connected:
+				bridgeLogger.Infof("Connected to WhatsApp")
+				disconnectedAt = nil
+				reconnectAttempts = 0
+			case *events.PushName:
+				_ = storeContactWithAlt(newClient, msgStore, v.JID, "", "", v.NewPushName, "")
+			case *events.BusinessName:
+				_ = storeContactWithAlt(newClient, msgStore, v.JID, "", "", "", v.NewBusinessName)
+			case *events.Contact:
+				if v.Action != nil {
+					_ = storeContactWithAlt(newClient, msgStore, v.JID, v.Action.GetFirstName(), v.Action.GetFullName(), "", "")
+				}
+			case *events.LoggedOut:
+				bridgeLogger.Warnf("Device logged out, please scan QR code to log in again")
+				loggedOut = true
+				now := time.Now()
+				disconnectedAt = &now
+			case *events.Disconnected:
+				bridgeLogger.Warnf("Disconnected from WhatsApp")
+				now := time.Now()
+				disconnectedAt = &now
+				if !loggedOut {
+					go attemptReconnect(newClient, bridgeLogger)
+				}
+			case *events.StreamError:
+				bridgeLogger.Warnf("Stream error: %+v", v)
+				now := time.Now()
+				disconnectedAt = &now
+				if !loggedOut {
+					go attemptReconnect(newClient, bridgeLogger)
+				}
+			case *events.TemporaryBan:
+				bridgeLogger.Warnf("Temporary ban: %s (code %d, expire %v)", v.Code, v.Code, v.Expire)
+			}
+		})
+
+		qrChan, _ := newClient.GetQRChannel(context.Background())
+		err := newClient.Connect()
+		if err != nil {
+			qrMu.Lock()
+			qrStatus = ""
+			qrMu.Unlock()
+			json.NewEncoder(w).Encode(map[string]interface{}{"status": "error", "message": err.Error()})
+			return
+		}
+
+		// Wait for first QR code
+		var qrCode string
+		timeout := time.After(30 * time.Second)
+		for {
+			select {
+			case evt, ok := <-qrChan:
+				if !ok {
+					qrMu.Lock()
+					qrStatus = ""
+					qrMu.Unlock()
+					json.NewEncoder(w).Encode(map[string]string{"status": "error", "message": "QR channel closed"})
+					return
+				}
+				if evt.Event == "code" {
+					qrCode = evt.Code
+					// Spawn goroutine to watch for success/timeout
+					go func() {
+						for evt := range qrChan {
+							if evt.Event == "success" {
+								qrMu.Lock()
+								qrStatus = "success"
+								qrMu.Unlock()
+								loggedOut = false
+								disconnectedAt = nil
+								reconnectAttempts = 0
+								activeClient = newClient
+								if newClient.Store.ID != nil {
+									ownJIDStringVal = newClient.Store.ID.ToNonAD().String()
+								}
+								syncContactsFromWhatsmeow(newClient, msgStore, bridgeLogger)
+								return
+							}
+							if evt.Event == "timeout" {
+								qrMu.Lock()
+								qrStatus = "timeout"
+								qrMu.Unlock()
+								return
+							}
+						}
+					}()
+					json.NewEncoder(w).Encode(map[string]string{"status": "qr", "code": qrCode})
+					return
+				}
+			case <-timeout:
+				qrMu.Lock()
+				qrStatus = "timeout"
+				qrMu.Unlock()
+				json.NewEncoder(w).Encode(map[string]string{"status": "timeout"})
+				return
+			}
+		}
+	})
+
+	// QR flow status polling endpoint
+	http.HandleFunc("/api/qr/status", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		qrMu.Lock()
+		s := qrStatus
+		// Reset after terminal states are read
+		if s == "success" || s == "timeout" {
+			qrStatus = ""
+		}
+		qrMu.Unlock()
+		if s == "" {
+			s = "idle"
+		}
+		json.NewEncoder(w).Encode(map[string]string{"status": s})
 	})
 
 	// Start the server
@@ -2325,38 +2514,22 @@ func main() {
 		}
 	})
 
-	// Create channel to track connection success
-	connected := make(chan bool, 1)
+	// Set globals for runtime re-login
+	activeClient = client
+	storeContainer = container
+	msgStore = messageStore
+	bridgeLogger = logger
+
+	// Start REST API server early so /api/status and /api/qr are available
+	startRESTServer(client, messageStore, 8080)
 
 	// Connect to WhatsApp
 	if client.Store.ID == nil {
-		// No ID stored, this is a new client, need to pair with phone
-		qrChan, _ := client.GetQRChannel(context.Background())
-		err = client.Connect()
-		if err != nil {
-			logger.Errorf("Failed to connect: %v", err)
-			return
-		}
-
-		// Print QR code for pairing with phone
-		for evt := range qrChan {
-			if evt.Event == "code" {
-				fmt.Println("\nScan this QR code with your WhatsApp app:")
-				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
-			} else if evt.Event == "success" {
-				connected <- true
-				break
-			}
-		}
-
-		// Wait for connection
-		select {
-		case <-connected:
-			fmt.Println("\nSuccessfully connected and authenticated!")
-		case <-time.After(3 * time.Minute):
-			logger.Errorf("Timeout waiting for QR code scan")
-			return
-		}
+		// No stored session — mark as logged out, let /api/qr handle re-login
+		logger.Infof("No stored session. Use /api/qr to authenticate.")
+		loggedOut = true
+		now := time.Now()
+		disconnectedAt = &now
 	} else {
 		// Already logged in, just connect
 		err = client.Connect()
@@ -2364,28 +2537,20 @@ func main() {
 			logger.Errorf("Failed to connect: %v", err)
 			return
 		}
-		connected <- true
+
+		time.Sleep(2 * time.Second)
+
+		if client.IsConnected() {
+			fmt.Println("\n✓ Connected to WhatsApp!")
+			if client.Store.ID != nil {
+				ownJIDStringVal = client.Store.ID.ToNonAD().String()
+			}
+			syncContactsFromWhatsmeow(client, messageStore, logger)
+		} else {
+			logger.Warnf("Failed to establish stable connection, will retry")
+			go attemptReconnect(client, logger)
+		}
 	}
-
-	// Wait a moment for connection to stabilize
-	time.Sleep(2 * time.Second)
-
-	if !client.IsConnected() {
-		logger.Errorf("Failed to establish stable connection")
-		return
-	}
-
-	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
-
-	if client.Store.ID != nil {
-		ownJIDStringVal = client.Store.ID.ToNonAD().String()
-	}
-
-	// Populate contacts table from whatsmeow's store
-	syncContactsFromWhatsmeow(client, messageStore, logger)
-
-	// Start REST API server
-	startRESTServer(client, messageStore, 8080)
 
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)
