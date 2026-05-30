@@ -1716,6 +1716,10 @@ func startRESTServer(_ *whatsmeow.Client, messageStore *MessageStore, port int) 
 		if reconnectAttempts > 0 {
 			status["reconnect_attempts"] = reconnectAttempts
 		}
+		if jid := ownJIDString(); jid != "" {
+			phone := strings.SplitN(jid, "@", 2)[0]
+			status["phone"] = "+" + phone
+		}
 		json.NewEncoder(w).Encode(status)
 	})
 
