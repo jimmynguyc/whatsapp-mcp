@@ -576,6 +576,14 @@ func buildQuoteContext(messageStore *MessageStore, quotedMessageID, chatJID stri
 // Package-level state; set in main() once login completes.
 var ownJIDStringVal string
 
+// Connection status tracking
+var (
+	bridgeStartedAt   = time.Now()
+	disconnectedAt    *time.Time
+	loggedOut         bool
+	reconnectAttempts int
+)
+
 func ownJIDString() string { return ownJIDStringVal }
 
 func coerceMessageTimestamp(v any) (time.Time, error) {
@@ -1646,7 +1654,53 @@ func extractDirectPathFromURL(url string) string {
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
+// attemptReconnect tries to reconnect with exponential backoff.
+// Stops after 10 attempts — requires manual restart or QR re-scan.
+func attemptReconnect(client *whatsmeow.Client, logger waLog.Logger) {
+	delays := []time.Duration{5, 15, 30, 60, 60, 60, 60, 60, 60, 60}
+	for i, delay := range delays {
+		reconnectAttempts = i + 1
+		logger.Infof("Reconnect attempt %d/%d in %ds...", i+1, len(delays), delay)
+		time.Sleep(delay * time.Second)
+
+		if client.IsConnected() {
+			logger.Infof("Already reconnected")
+			return
+		}
+
+		err := client.Connect()
+		if err != nil {
+			logger.Warnf("Reconnect attempt %d failed: %v", i+1, err)
+			continue
+		}
+
+		time.Sleep(2 * time.Second)
+		if client.IsConnected() {
+			logger.Infof("Reconnected successfully on attempt %d", i+1)
+			return
+		}
+	}
+	logger.Errorf("Failed to reconnect after %d attempts. Manual intervention required.", len(delays))
+}
+
 func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
+	// Connection status endpoint
+	http.HandleFunc("/api/status", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		status := map[string]interface{}{
+			"connected":      client.IsConnected(),
+			"logged_in":      client.Store.ID != nil && !loggedOut,
+			"uptime_seconds":  int(time.Since(bridgeStartedAt).Seconds()),
+		}
+		if disconnectedAt != nil {
+			status["disconnected_since"] = disconnectedAt.Format(time.RFC3339)
+		}
+		if reconnectAttempts > 0 {
+			status["reconnect_attempts"] = reconnectAttempts
+		}
+		json.NewEncoder(w).Encode(status)
+	})
+
 	// Handler for sending messages
 	http.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
@@ -2222,6 +2276,8 @@ func main() {
 
 		case *events.Connected:
 			logger.Infof("Connected to WhatsApp")
+			disconnectedAt = nil
+			reconnectAttempts = 0
 
 		case *events.PushName:
 			// Sender's push name changed — update our contacts table.
@@ -2244,6 +2300,28 @@ func main() {
 
 		case *events.LoggedOut:
 			logger.Warnf("Device logged out, please scan QR code to log in again")
+			loggedOut = true
+			now := time.Now()
+			disconnectedAt = &now
+
+		case *events.Disconnected:
+			logger.Warnf("Disconnected from WhatsApp")
+			now := time.Now()
+			disconnectedAt = &now
+			if !loggedOut {
+				go attemptReconnect(client, logger)
+			}
+
+		case *events.StreamError:
+			logger.Warnf("Stream error: %+v", v)
+			now := time.Now()
+			disconnectedAt = &now
+			if !loggedOut {
+				go attemptReconnect(client, logger)
+			}
+
+		case *events.TemporaryBan:
+			logger.Warnf("Temporary ban: %s (code %d, expire %v)", v.Code, v.Code, v.Expire)
 		}
 	})
 
