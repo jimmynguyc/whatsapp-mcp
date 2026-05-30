@@ -2303,6 +2303,11 @@ func startRESTServer(_ *whatsmeow.Client, messageStore *MessageStore, port int) 
 				if !loggedOut {
 					go attemptReconnect(newClient, bridgeLogger)
 				}
+			case *events.StreamReplaced:
+				bridgeLogger.Warnf("Stream replaced (another device took over), reconnecting...")
+				now := time.Now()
+				disconnectedAt = &now
+				go attemptReconnect(newClient, bridgeLogger)
 			case *events.TemporaryBan:
 				bridgeLogger.Warnf("Temporary ban: %s (code %d, expire %v)", v.Code, v.Code, v.Expire)
 			}
@@ -2512,6 +2517,12 @@ func main() {
 			if !loggedOut {
 				go attemptReconnect(client, logger)
 			}
+
+		case *events.StreamReplaced:
+			logger.Warnf("Stream replaced (another device took over), reconnecting...")
+			now := time.Now()
+			disconnectedAt = &now
+			go attemptReconnect(client, logger)
 
 		case *events.TemporaryBan:
 			logger.Warnf("Temporary ban: %s (code %d, expire %v)", v.Code, v.Code, v.Expire)
