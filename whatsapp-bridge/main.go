@@ -2709,11 +2709,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		}
 
 		if name == "" {
-			if sender != "" {
-				name = sender
-			} else {
-				name = jid.User
-			}
+			name = jid.User
 		}
 
 		logger.Infof("Using contact name: %s", name)
@@ -2762,9 +2758,8 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 				continue
 			}
 
-			messageStore.StoreChat(chatJID, name, timestamp)
-
-			// Store messages
+			// Store messages (only create chat if there are actual messages)
+			hasMessages := false
 			for _, msg := range messages {
 				if msg == nil || msg.Message == nil {
 					continue
@@ -2867,6 +2862,7 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					logger.Warnf("Failed to store history message: %v", err)
 				} else {
 					syncedCount++
+					hasMessages = true
 					// Log successful message storage
 					if mediaType != "" {
 						logger.Infof("Stored message: [%s] %s -> %s: [%s: %s] %s",
@@ -2876,6 +2872,10 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 							timestamp.Format("2006-01-02 15:04:05"), sender, chatJID, content)
 					}
 				}
+			}
+
+			if hasMessages {
+				messageStore.StoreChat(chatJID, name, timestamp)
 			}
 		}
 	}
