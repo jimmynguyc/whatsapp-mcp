@@ -878,8 +878,14 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 	}
 	chatJID = messageStore.ResolveChatJID(chatJID)
 
-	// Ensure chat exists before inserting message (FK constraint)
-	name := messageStore.GetContactName(chatJID)
+	// Ensure chat exists before inserting message (FK constraint).
+	// Preserve existing chat name; only set a new one if the chat is brand new.
+	var existingName string
+	_ = messageStore.db.QueryRow("SELECT name FROM chats WHERE jid = ?", chatJID).Scan(&existingName)
+	name := existingName
+	if name == "" || name == recipientJID.User {
+		name = messageStore.GetContactName(chatJID)
+	}
 	if name == "" {
 		name = recipientJID.User
 	}
@@ -2636,11 +2642,12 @@ func syncContactsFromWhatsmeow(client *whatsmeow.Client, messageStore *MessageSt
 
 // GetChatName determines the appropriate name for a chat based on JID and other info
 func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types.JID, chatJID string, conversation interface{}, sender string, logger waLog.Logger) string {
-	// First, check if chat already exists in database with a name
+	// First, check if chat already exists in database with a real name
+	// (not just the raw JID user part which is a placeholder).
 	var existingName string
 	err := messageStore.db.QueryRow("SELECT name FROM chats WHERE jid = ?", chatJID).Scan(&existingName)
-	if err == nil && existingName != "" {
-		// Chat exists with a name, use that
+	userPart := jid.User
+	if err == nil && existingName != "" && existingName != userPart && !strings.HasPrefix(existingName, "Group ") {
 		logger.Infof("Using existing chat name for %s: %s", chatJID, existingName)
 		return existingName
 	}
